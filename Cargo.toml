@@ -47,6 +47,10 @@ aya-log = { version = "0.2", optional = true }
 # tempfile for filesystem-seam tests (platform::linux::tests drives
 # collect_interface_stats_from against a tempdir-shaped sysfs).
 tempfile = "3"
+# proptest for fuzz-style property tests on the highest-stakes parsers
+# (ss, nettop, /proc/meminfo, /proc/stat). Catches invariant breaks
+# that fixture-based tests miss.
+proptest = "1"
 
 [workspace]
 members = ["crates/common"]

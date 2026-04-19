@@ -368,6 +368,13 @@ pub(crate) fn parse_lsof_output(text: &str) -> Vec<ConnectionDetail> {
         }
 
         let tag = line.as_bytes()[0];
+        // The lsof field format uses single ASCII letter tags. If the first
+        // byte is the start of a multi-byte UTF-8 sequence (top bit set),
+        // skip the line — both because we have no tag to match, and because
+        // `&line[1..]` would panic on a non-char-boundary index.
+        if !tag.is_ascii() {
+            continue;
+        }
         let value = &line[1..];
 
         match tag {
@@ -775,5 +782,91 @@ tcp4 10.0.0.1:1<->10.0.0.2:2 en0 Established 100 100 0 0 0 12.5 ms 45.0 ms 0 0
             .get(&("10.0.0.1:1".into(), "10.0.0.2:2".into()))
             .unwrap();
         assert!((rtt - 12_500.0).abs() < 1.0);
+    }
+
+    // ── Property-based tests ─────────────────────────────────────────────
+
+    proptest::proptest! {
+        /// Arbitrary UTF-8 input must never make the ss parser panic, and
+        /// every connection it emits must have the minimum fields populated.
+        #[test]
+        fn prop_parse_ss_output_never_panics_and_emits_complete_rows(
+            s in ".{0,5000}"
+        ) {
+            let conns = parse_ss_output(&s);
+            for c in &conns {
+                proptest::prop_assert!(!c.protocol.is_empty());
+                proptest::prop_assert!(!c.local_addr.is_empty());
+                proptest::prop_assert!(!c.remote_addr.is_empty());
+                proptest::prop_assert!(!c.state.is_empty());
+                if let Some(rtt) = c.kernel_rtt_us {
+                    proptest::prop_assert!(rtt.is_finite() && rtt > 0.0);
+                }
+            }
+        }
+
+        /// nettop output: any emitted RTT must be strictly positive and
+        /// finite. Zero and negative values are explicitly filtered by
+        /// the parser.
+        #[test]
+        fn prop_parse_nettop_output_never_emits_zero_or_negative_rtt(
+            s in ".{0,5000}"
+        ) {
+            let map = parse_nettop_output(&s);
+            for (_, rtt) in map.iter() {
+                proptest::prop_assert!(rtt.is_finite() && *rtt > 0.0);
+            }
+        }
+
+        /// lsof field output: arbitrary input must not panic.
+        #[test]
+        fn prop_parse_lsof_output_never_panics(s in ".{0,5000}") {
+            let _ = parse_lsof_output(&s);
+        }
+
+        /// `top_connections` respects `max` and always puts ESTABLISHED
+        /// rows first regardless of input ordering.
+        #[test]
+        fn prop_top_connections_respects_max_and_prefers_established(
+            established_count in 0usize..20,
+            other_count in 0usize..20,
+            max in 0usize..50,
+        ) {
+            let mut conns: Vec<ConnectionDetail> = Vec::new();
+            for i in 0..established_count {
+                conns.push(ConnectionDetail {
+                    protocol: "TCP".into(),
+                    local_addr: format!("e{i}"),
+                    remote_addr: "a".into(),
+                    state: "ESTABLISHED".into(),
+                    pid: None,
+                    process_name: None,
+                    kernel_rtt_us: None,
+                });
+            }
+            for i in 0..other_count {
+                conns.push(ConnectionDetail {
+                    protocol: "TCP".into(),
+                    local_addr: format!("o{i}"),
+                    remote_addr: "a".into(),
+                    state: "TIME_WAIT".into(),
+                    pid: None,
+                    process_name: None,
+                    kernel_rtt_us: None,
+                });
+            }
+            let total = established_count + other_count;
+            let ranked = top_connections(conns, max);
+            proptest::prop_assert!(ranked.len() <= max);
+            proptest::prop_assert!(ranked.len() <= total);
+            // No non-ESTABLISHED row appears before an ESTABLISHED row.
+            let first_non_est = ranked.iter().position(|c| c.state != "ESTABLISHED");
+            if let Some(idx) = first_non_est {
+                proptest::prop_assert!(
+                    !ranked[idx..].iter().any(|c| c.state == "ESTABLISHED"),
+                    "non-ESTAB row appeared before an ESTAB row"
+                );
+            }
+        }
     }
 }

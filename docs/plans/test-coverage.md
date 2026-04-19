@@ -1,6 +1,6 @@
 # Plan — Drive line coverage from 72 % to 90 %
 
-> Status: proposal, not started.
+> Status: **Phases 1–4 shipped.** Landed at 86 % line coverage (planned 90 %; shortfall is macOS-specific `system::*` paths and unsafe `libc::statvfs` that can't be reached from a non-privileged test harness without trait-based mocking of the syscall itself).
 > Owner: TBD.
 > Scope: SDK only. Doesn't include the `netwatch-agent` integration suite.
 

@@ -237,13 +237,20 @@ fn parse_cpu_stat_line(line: &str) -> Option<CpuSample> {
 /// two `/proc/stat` samples. `before` must have been taken strictly before
 /// `after`; otherwise `saturating_sub` clamps the deltas to zero and we
 /// return 0 %.
+///
+/// Both `saturating_sub` and the final clamp exist to keep the result
+/// well-formed for *any* pair of samples, including ones where
+/// `after.idle < before.idle` (counter reset, kernel bug, time travel
+/// in a test harness). Without the clamp, `idle_diff` could exceed
+/// `total_diff` and the unchecked `u64` subtraction would underflow.
 pub fn cpu_pct_from_samples(before: &CpuSample, after: &CpuSample) -> f64 {
     let total_diff = after.total.saturating_sub(before.total);
     if total_diff == 0 {
         return 0.0;
     }
     let idle_diff = after.idle.saturating_sub(before.idle);
-    let usage = (total_diff - idle_diff) as f64 / total_diff as f64 * 100.0;
+    let busy = total_diff.saturating_sub(idle_diff);
+    let usage = busy as f64 / total_diff as f64 * 100.0;
     (usage * 10.0).round() / 10.0
 }
 
@@ -758,5 +765,95 @@ cpu2 10 1 5 100 0 0 0 0 0 0
         };
         // 1000 - 37 = 963 busy → 96.3%.
         assert!((cpu_pct_from_samples(&before, &after) - 96.3).abs() < 1e-9);
+    }
+
+    // ── Property-based tests ─────────────────────────────────────────────
+    //
+    // Fixture tests prove specific inputs produce specific outputs. Properties
+    // here catch the class of bugs that slips past fixtures: invariant breaks
+    // on *any* well-formed input the parser accepts.
+
+    proptest::proptest! {
+        #[test]
+        fn prop_parse_proc_loadavg_never_panics(s in ".{0,200}") {
+            let _ = parse_proc_loadavg(&s);
+        }
+
+        #[test]
+        fn prop_parse_proc_loadavg_values_are_finite(
+            a in 0.0f64..1000.0,
+            b in 0.0f64..1000.0,
+            c in 0.0f64..1000.0,
+        ) {
+            let line = format!("{a} {b} {c} 1/237 12345");
+            let la = parse_proc_loadavg(&line).expect("three finite numbers must parse");
+            proptest::prop_assert!(la.one.is_finite() && la.one >= 0.0);
+            proptest::prop_assert!(la.five.is_finite() && la.five >= 0.0);
+            proptest::prop_assert!(la.fifteen.is_finite() && la.fifteen >= 0.0);
+        }
+
+        #[test]
+        fn prop_parse_proc_meminfo_used_plus_available_bounded_by_total(
+            total_kb in 1u64..1_000_000_000,
+            avail_kb in 0u64..500_000_000,
+        ) {
+            // Constrain avail ≤ total so the fixture is internally valid.
+            let avail_kb = avail_kb.min(total_kb);
+            let sample = format!(
+                "MemTotal: {total_kb} kB\nMemAvailable: {avail_kb} kB\n"
+            );
+            let m = parse_proc_meminfo(&sample).expect("valid input must parse");
+            // Used is defined as total - available, so used + available == total.
+            proptest::prop_assert_eq!(m.used_bytes + m.available_bytes, m.total_bytes);
+            proptest::prop_assert!(m.available_bytes <= m.total_bytes);
+        }
+
+        #[test]
+        fn prop_parse_proc_stat_aggregate_idle_never_exceeds_total(
+            user in 0u64..100_000_000,
+            nice in 0u64..100_000_000,
+            system in 0u64..100_000_000,
+            idle in 0u64..100_000_000,
+            iowait in 0u64..100_000_000,
+        ) {
+            let line = format!("cpu  {user} {nice} {system} {idle} {iowait} 0 0 0 0 0");
+            let s = parse_proc_stat_aggregate(&line).expect("ten fields must parse");
+            // By construction total = sum of all ten, which includes idle.
+            proptest::prop_assert!(s.idle <= s.total);
+        }
+
+        #[test]
+        fn prop_cpu_pct_is_bounded_zero_to_one_hundred(
+            b_idle in 0u64..u32::MAX as u64,
+            b_total in 0u64..u32::MAX as u64,
+            a_idle in 0u64..u32::MAX as u64,
+            a_total in 0u64..u32::MAX as u64,
+        ) {
+            let before = CpuSample { idle: b_idle, total: b_total };
+            let after  = CpuSample { idle: a_idle, total: a_total };
+            let pct = cpu_pct_from_samples(&before, &after);
+            proptest::prop_assert!(pct.is_finite());
+            proptest::prop_assert!((0.0..=100.0).contains(&pct));
+        }
+
+        #[test]
+        fn prop_parse_vm_stat_never_overflows_available(
+            free in 0u64..1_000_000,
+            inactive in 0u64..1_000_000,
+            speculative in 0u64..1_000_000,
+            total_gb in 1u64..1024,
+        ) {
+            let total_bytes = total_gb * 1024 * 1024 * 1024;
+            let sample = format!(
+                "Mach Virtual Memory Statistics: (page size of 16384 bytes)\n\
+                 Pages free:                      {free}.\n\
+                 Pages inactive:                  {inactive}.\n\
+                 Pages speculative:               {speculative}.\n"
+            );
+            let m = parse_vm_stat(&sample, total_bytes).expect("must parse");
+            proptest::prop_assert_eq!(m.total_bytes, total_bytes);
+            // used = total.saturating_sub(available), so used ≤ total always.
+            proptest::prop_assert!(m.used_bytes <= m.total_bytes);
+        }
     }
 }

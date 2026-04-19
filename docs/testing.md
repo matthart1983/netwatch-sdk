@@ -8,7 +8,7 @@ That's the whole thing — no fixtures, no test database, no env vars required. 
 
 ## What's covered
 
-115 unit tests across 9 modules, weighted toward parsing and state-machine logic. The shape of the suite:
+125 unit tests across 9 modules — 115 fixture tests plus 10 property-based cases — weighted toward parsing and state-machine logic. The shape of the suite:
 
 | Module                 | Tests | What they actually exercise                                                                                               |
 | ---------------------- | ----: | ------------------------------------------------------------------------------------------------------------------------- |
@@ -21,6 +21,16 @@ That's the whole thing — no fixtures, no test database, no env vars required. 
 | `config.rs`            | 11    | `parse_default_gateway_ip_route`, `parse_default_gateway_netstat` (Linux + macOS formats), `parse_first_nameserver` (comments, indent, keyword-prefix safety) |
 | `disk.rs`              | 13    | `parse_proc_mounts` (real devices, virtual FS skip, snap/loop filtering), `parse_macos_mount` (root, firmlink skip), `parse_proc_diskstats` (sector summing, loop/ram/dm-* skip) |
 | `platform/linux.rs`    | 5     | `collect_interface_stats_from` driven against a tempfile-populated sysfs tree: counters + operstate, loopback-skip, missing-file defaults, operstate variants (up/down/unknown), missing-root error |
+
+## Property-based tests
+
+In addition to the fixture suite, `parse_ss_output`, `parse_nettop_output`, `parse_lsof_output`, `parse_proc_meminfo`, `parse_proc_loadavg`, `parse_proc_stat_aggregate`, `parse_vm_stat`, and `cpu_pct_from_samples` each have a `proptest` block in their module. The properties assert invariants — never panics on arbitrary bytes, emitted fields always populated, `used_bytes ≤ total_bytes`, `cpu_pct` always in `[0, 100]` — and each case runs against several hundred random inputs per run.
+
+These already paid for themselves:
+- `parse_lsof_output` was panicking on lines whose first byte was the start of a multi-byte UTF-8 sequence (e.g. `é…`) — `&line[1..]` would land inside a char.
+- `cpu_pct_from_samples` was underflowing a `u64` subtraction when `idle_diff > total_diff` (counter-reset edge case).
+
+Both bugs were invisible to the fixture suite.
 
 ## Test conventions in this repo
 
