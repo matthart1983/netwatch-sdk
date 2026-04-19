@@ -110,7 +110,9 @@ mod linux {
     use super::*;
     use crate::ebpf::event::{estimate_boot_time, ConnectEvent};
     use aya::{maps::RingBuf, programs::KProbe, Bpf};
-    use std::sync::mpsc;
+    use std::os::fd::AsRawFd;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::{mpsc, Arc};
     use std::thread::{self, JoinHandle};
 
     /// The compiled BPF object, embedded at build time by `build.rs`.
@@ -119,11 +121,25 @@ mod linux {
     /// content surfaces as [`EbpfError::BpfObjectMissing`] at runtime.
     const BPF_OBJECT: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/netwatch_sdk_ebpf.o"));
 
+    /// Poll timeout. Bounds shutdown latency: dropping the EventSource
+    /// flips the shutdown flag and the reader thread exits within at
+    /// most this many milliseconds.
+    const POLL_TIMEOUT_MS: i32 = 100;
+
     pub struct Inner {
         // aya::Bpf must outlive every attached program; dropping it detaches.
         _bpf: Bpf,
-        // Reader thread joins on Drop via the channel close.
-        _reader: JoinHandle<()>,
+        shutdown: Arc<AtomicBool>,
+        reader: Option<JoinHandle<()>>,
+    }
+
+    impl Drop for Inner {
+        fn drop(&mut self) {
+            self.shutdown.store(true, Ordering::Relaxed);
+            if let Some(h) = self.reader.take() {
+                let _ = h.join();
+            }
+        }
     }
 
     pub fn new() -> Result<(EventSource, Receiver<EbpfEvent>), EbpfError> {
@@ -157,17 +173,50 @@ mod linux {
         let mut ring: RingBuf<_> = RingBuf::try_from(events_map)
             .map_err(|e| EbpfError::LoadFailed(format!("EVENTS not a RingBuf: {e:?}")))?;
 
+        // Cache the ring buffer's underlying fd for poll(2). aya's RingBuf
+        // is registered as a poll-friendly fd by the kernel: POLLIN
+        // signals data is available.
+        let ring_fd = ring.as_raw_fd();
+
         let (tx, rx) = mpsc::channel::<EbpfEvent>();
         let boot = estimate_boot_time();
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let shutdown_for_thread = shutdown.clone();
 
-        // One reader thread polls the ring buffer in a loop. We use a
-        // simple busy-poll with a yield; for production an epoll-based
-        // wakeup would be more efficient. Phase 1: simple and correct.
+        // Reader thread blocks in poll(2) until the kernel signals data
+        // is ready or the configured timeout elapses. The timeout is the
+        // worst-case shutdown latency — between iterations the thread
+        // checks the shutdown flag and exits cleanly.
         let reader = thread::Builder::new()
             .name("netwatch-sdk-ebpf-reader".into())
             .spawn(move || {
                 use netwatch_sdk_common::{ConnectV4Event, EventKind};
+                let mut pollfd = libc::pollfd {
+                    fd: ring_fd,
+                    events: libc::POLLIN,
+                    revents: 0,
+                };
                 loop {
+                    if shutdown_for_thread.load(Ordering::Relaxed) {
+                        return;
+                    }
+
+                    // SAFETY: pollfd is a valid initialised value, length 1.
+                    let n = unsafe { libc::poll(&mut pollfd, 1, POLL_TIMEOUT_MS) };
+                    if n < 0 {
+                        let err = std::io::Error::last_os_error();
+                        if err.raw_os_error() == Some(libc::EINTR) {
+                            continue;
+                        }
+                        // Hard poll error — exit so we don't busy-loop on
+                        // a permanently broken fd.
+                        return;
+                    }
+
+                    // Always drain — `poll` returning 0 (timeout) just
+                    // means no wakeup arrived; events that landed between
+                    // the previous drain and the poll register are still
+                    // sitting in the ring buffer.
                     while let Some(item) = ring.next() {
                         let bytes = item.as_ref();
                         if bytes.is_empty() {
@@ -190,7 +239,6 @@ mod linux {
                             }
                         }
                     }
-                    std::thread::sleep(std::time::Duration::from_millis(5));
                 }
             })?;
 
@@ -198,7 +246,8 @@ mod linux {
             EventSource {
                 _inner: Inner {
                     _bpf: bpf,
-                    _reader: reader,
+                    shutdown,
+                    reader: Some(reader),
                 },
             },
             rx,

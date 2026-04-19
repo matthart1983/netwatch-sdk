@@ -29,12 +29,47 @@
 
 **Verification on macOS:** `cargo test` (default) → 73 pass. `cargo test --features ebpf` → 78 pass (5 new ebpf tests). The actual BPF program hasn't been compiled yet (needs Linux + nightly + `bpf-linker`), so `EventSource::new()` would return `BpfObjectMissing` at runtime today.
 
-## Known limitations / next-session work
+## Phase 1 close-out status
 
-- **CO-RE not yet wired in the kprobe.** The kprobe reads `struct sock` fields at hard-coded offsets that match a 5.15 reference kernel. This works for the proof of concept but won't be portable across kernels until we switch to aya's CO-RE relocations.
-- **Source port is always 0.** It lives at a different offset (`inet_sock->inet_sport`) than the destination (`__sk_common.skc_dport`) and reading it cleanly needs CO-RE.
-- **Reader thread is a busy-poll loop with a 5 ms sleep.** Replace with `epoll`-based wakeup once Phase 2 is on the board.
-- **No CI for the BPF build.** Add a `--privileged` Docker step or a self-hosted Linux runner that installs `bpf-linker`, runs `scripts/build-ebpf.sh`, and runs the integration test inside an Ubuntu 22.04 container with `--cap-add BPF --cap-add PERFMON`.
+| Item                                                         | Status              |
+| ------------------------------------------------------------ | ------------------- |
+| Workspace + crate layout                                     | ✅ shipped           |
+| `tcp_v4_connect` kprobe (real BPF program, not a stub)       | ✅ shipped           |
+| `EventSource` userspace API + decoder                        | ✅ shipped           |
+| CI builds the BPF object on every push                       | ✅ shipped (`ebpf-build` job) |
+| `--features ebpf` builds + tests on Linux + macOS            | ✅ shipped           |
+| Reader thread: `poll(2)`-based wakeup with shutdown flag     | ✅ shipped           |
+| CO-RE relocations for portable struct reads                  | ⏳ **deferred**      |
+| Privileged-container kernel-attach integration test          | ⏳ **deferred**      |
+
+CI proves the kprobe compiles to a valid eBPF ELF object (`file` reports `ELF 64-bit LSB relocatable, eBPF, version 1 (SYSV)`); the verifier hasn't actually loaded it in a kernel yet — that's what the deferred integration test will do.
+
+## Deferred items — what they need
+
+### CO-RE wiring
+
+**Why deferred:** the current kprobe reads `struct sock` fields at hard-coded offsets matching a 5.15 reference kernel. Switching to CO-RE means generating Rust bindings via `aya-tool generate sock` against a running kernel's BTF, then re-writing the field reads to use those bindings. Both steps need a Linux kernel to validate; doing it speculatively from macOS would be guesswork.
+
+**Next-session steps (Linux required):**
+
+1. `cargo install aya-tool` on a host with `/sys/kernel/btf/vmlinux` (Ubuntu 22.04+ ships BTF in the kernel).
+2. `aya-tool generate sock inet_sock task_struct > crates/ebpf-programs/src/vmlinux.rs` and check the file in.
+3. Replace the raw-offset reads in `try_tcp_v4_connect` with field accesses on the generated types — aya's `bpf_core_read!` macro handles the relocation.
+4. Read `inet_sock->inet_sport` to populate the source port (currently always 0).
+5. Bump `aya-ebpf` features to enable `core-relocations` if not already on by default.
+6. Verify the resulting BPF object loads and runs on at least one kernel newer than 5.15 to prove portability.
+
+### Privileged-container integration test
+
+**Why deferred:** GitHub-hosted runners can't easily expose `CAP_BPF` + `CAP_PERFMON` to a container without `--privileged`, and the inner program also needs a writable `bpffs`. Standing it up is a ~half-day of CI plumbing.
+
+**Next-session steps:**
+
+1. Add a `ebpf-integration` job that runs the SDK tests inside `docker run --privileged --pid=host -v $PWD:/work ubuntu:24.04 bash -c '…'`.
+2. Inside the container: install `clang` + `libelf` + `bpftool`, set up `/sys/kernel/btf` mount, run a small Rust integration test that calls `EventSource::new()`, opens a TCP socket to `127.0.0.1:1`, and asserts a `Connect` event arrives within 1 second.
+3. Add `--cap-add BPF --cap-add PERFMON` + a `securityContext.privileged: true` workaround if `--privileged` is too broad.
+
+## Original phase plan
 
 ## Non-goals
 
