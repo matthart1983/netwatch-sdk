@@ -30,3 +30,29 @@ jobs:
       - name: cargo clippy
         run: cargo clippy --all-targets -- -D warnings
         continue-on-error: true
+
+  coverage:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: llvm-tools-preview
+      - uses: Swatinem/rust-cache@v2
+      - name: Install cargo-llvm-cov
+        uses: taiki-e/install-action@cargo-llvm-cov
+      # Single instrumented run; subsequent `report` invocations reuse the data
+      # so we don't pay for re-compiling tests just to change the output format.
+      # Threshold (--fail-under-lines) is set just below the current baseline so
+      # a regression fails CI but day-to-day improvements don't trip an alert.
+      - name: Run coverage
+        run: cargo llvm-cov --lib --no-report
+      - name: Coverage summary
+        run: cargo llvm-cov report --summary-only --fail-under-lines 65
+      - name: Generate LCOV
+        run: cargo llvm-cov report --lcov --output-path lcov.info
+      - name: Upload coverage report
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-lcov
+          path: lcov.info

@@ -57,23 +57,36 @@ cargo test --package netwatch-sdk -- --nocapture    # see println! output
 
 ## Measuring coverage
 
-There's no coverage tool wired into CI today. The lightest-weight option is `cargo-llvm-cov` (works on Linux and macOS, no nightly required):
+CI runs `cargo-llvm-cov` on every push and uploads an `lcov.info` artifact. The job fails if line coverage drops below **65 %** (current baseline is ~72 %, so there's modest headroom).
+
+To reproduce locally:
 
 ```sh
-cargo install cargo-llvm-cov
-cargo llvm-cov --workspace --summary-only
+cargo install cargo-llvm-cov            # one-time
+rustup component add llvm-tools-preview # one-time
+cargo llvm-cov --lib --summary-only
 ```
 
-Add it to CI by appending to `.github/workflows/ci.yml`:
+Per-file baseline at the time of writing:
 
-```yaml
-- name: Install cargo-llvm-cov
-  uses: taiki-e/install-action@cargo-llvm-cov
-- name: Coverage
-  run: cargo llvm-cov --workspace --summary-only
-```
+| File                              | Lines  |
+| --------------------------------- | -----: |
+| `collectors/process_bandwidth.rs` |  99 %  |
+| `collectors/traffic.rs`           |  94 %  |
+| `collectors/config.rs`            |  85 %  |
+| `collectors/connections.rs`       |  78 %  |
+| `collectors/network_intel.rs`     |  74 %  |
+| `collectors/health.rs`            |  65 %  |
+| `collectors/system.rs`            |  62 %  |
+| `collectors/disk.rs`              |   0 %  |
+| `platform/linux.rs`               |   0 %  |
+| **Total**                         | **72 %** |
 
-A nice baseline goal is 70 %+ on `collectors/*` (parsers and detectors) and not worrying about platform shims that can't be exercised cross-platform.
+`platform/linux.rs` is at 0 % because nothing in the test suite calls `collect_interface_stats()` directly — `traffic` tests construct an `InterfaceStats` map by hand. That's by design: platform shims are exercised by the integration suite in the agent, not by SDK unit tests.
+
+`disk.rs` at 0 % is the real gap. Same fix as `system.rs` — extract `parse_proc_diskstats(&str)` and `parse_mount_output(&str)` and add fixture tests.
+
+Once coverage trends up, raise `--fail-under-lines` in `.github/workflows/ci.yml` so the floor moves with you.
 
 ## Pre-commit hook (recommended)
 
