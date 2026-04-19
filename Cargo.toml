@@ -1,0 +1,18 @@
+[package]
+name = "netwatch-sdk"
+version = "0.1.0"
+edition = "2021"
+description = "Shared wire-format types and collectors for NetWatch Cloud — the SDK consumed by netwatch-agent and the NetWatch Cloud server. Parses /proc, ss, lsof, nettop, and libpcap events into a common Snapshot payload."
+license = "MIT"
+repository = "https://github.com/matthart1983/netwatch-sdk"
+homepage = "https://github.com/matthart1983/netwatch-sdk"
+readme = "README.md"
+keywords = ["network", "monitoring", "observability", "sdk"]
+categories = ["network-programming", "api-bindings"]
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+anyhow = "1"
+chrono = { version = "0.4", features = ["serde"] }
+uuid = { version = "1", features = ["v4", "serde"] }
+libc = "0.2"
