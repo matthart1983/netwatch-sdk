@@ -8,7 +8,7 @@ That's the whole thing — no fixtures, no test database, no env vars required. 
 
 ## What's covered
 
-60 unit tests across 7 modules, weighted toward parsing and state-machine logic. The shape of the suite:
+73 unit tests across 8 modules, weighted toward parsing and state-machine logic. The shape of the suite:
 
 | Module                 | Tests | What they actually exercise                                                                                               |
 | ---------------------- | ----: | ------------------------------------------------------------------------------------------------------------------------- |
@@ -19,7 +19,7 @@ That's the whole thing — no fixtures, no test database, no env vars required. 
 | `health.rs`            | 8     | `parse_loss` (zero / partial / full), `parse_avg_rtt`, `RttHistory` window cap, `Option<f64>` gap preservation            |
 | `system.rs`            | 14    | `parse_proc_loadavg`, `parse_proc_meminfo` (with/without `MemAvailable`), `parse_proc_swap`, `parse_vm_stat`, `parse_macos_swapusage`, `parse_proc_cpuinfo_model` |
 | `config.rs`            | 11    | `parse_default_gateway_ip_route`, `parse_default_gateway_netstat` (Linux + macOS formats), `parse_first_nameserver` (comments, indent, keyword-prefix safety) |
-| `disk.rs`              | **0** | Pending — `/proc/mounts` and `mount` parsing should be extracted as pure functions and tested the same way                |
+| `disk.rs`              | 13    | `parse_proc_mounts` (real devices, virtual FS skip, snap/loop filtering), `parse_macos_mount` (root, firmlink skip), `parse_proc_diskstats` (sector summing, loop/ram/dm-* skip) |
 
 ## Test conventions in this repo
 
@@ -50,14 +50,14 @@ cargo test --package netwatch-sdk -- --nocapture    # see println! output
 
 ## Coverage gaps worth knowing
 
-- **`disk::*` parsers are still inline** with the I/O — until they're extracted as pure functions like `system::parse_proc_meminfo`, they can't be unit-tested with fixtures. Same recipe: pull `parse_proc_diskstats(&str)` and `parse_mount_output(&str)` out, then add tests against captured output.
-- **`system::measure_cpu_usage` and `measure_cpu_per_core` aren't tested** because they sleep and read live `/proc/stat`. Hard to fixture without a clock abstraction.
+- **`system::measure_cpu_usage` and `measure_cpu_per_core` aren't tested** because they sleep and read live `/proc/stat`. Reaching them needs the FsReader seam (Phase 3 in `docs/plans/test-coverage.md`).
+- **`libc::statvfs` paths in `disk::stat_mount` aren't tested** — same class of problem as the CPU sampling. Unsafe syscall, no mock today.
 - **Live `connections::collect_connections` runs `ss`/`lsof`/`nettop` against the real machine.** The test asserts only "no panic; results are well-formed", because exact contents depend on the host.
 - **Cross-platform behaviour is verified by running CI on both Linux and macOS runners**, not by mocking each platform from the other.
 
 ## Measuring coverage
 
-CI runs `cargo-llvm-cov` on every push and uploads an `lcov.info` artifact. The job fails if line coverage drops below **65 %** (current baseline is ~72 %, so there's modest headroom).
+CI runs `cargo-llvm-cov` on every push and uploads an `lcov.info` artifact. The job fails if line coverage drops below **70 %** (current baseline is ~76 %, so there's modest headroom).
 
 To reproduce locally:
 
@@ -74,17 +74,17 @@ Per-file baseline at the time of writing:
 | `collectors/process_bandwidth.rs` |  99 %  |
 | `collectors/traffic.rs`           |  94 %  |
 | `collectors/config.rs`            |  85 %  |
+| `collectors/disk.rs`              |  84 %  |
 | `collectors/connections.rs`       |  78 %  |
 | `collectors/network_intel.rs`     |  74 %  |
 | `collectors/health.rs`            |  65 %  |
 | `collectors/system.rs`            |  62 %  |
-| `collectors/disk.rs`              |   0 %  |
 | `platform/linux.rs`               |   0 %  |
-| **Total**                         | **72 %** |
+| **Total**                         | **76 %** |
 
 `platform/linux.rs` is at 0 % because nothing in the test suite calls `collect_interface_stats()` directly — `traffic` tests construct an `InterfaceStats` map by hand. That's by design: platform shims are exercised by the integration suite in the agent, not by SDK unit tests.
 
-`disk.rs` at 0 % is the real gap. Same fix as `system.rs` — extract `parse_proc_diskstats(&str)` and `parse_mount_output(&str)` and add fixture tests.
+The remaining ~16 % on `disk.rs` is the unsafe `libc::statvfs` path inside `stat_mount`. Reaching it from a unit test would require an `FsReader`-style seam — see `docs/plans/test-coverage.md` Phase 3.
 
 Once coverage trends up, raise `--fail-under-lines` in `.github/workflows/ci.yml` so the floor moves with you.
 
