@@ -8,15 +8,15 @@ That's the whole thing — no fixtures, no test database, no env vars required. 
 
 ## What's covered
 
-73 unit tests across 8 modules, weighted toward parsing and state-machine logic. The shape of the suite:
+99 unit tests across 8 modules, weighted toward parsing and state-machine logic. The shape of the suite:
 
 | Module                 | Tests | What they actually exercise                                                                                               |
 | ---------------------- | ----: | ------------------------------------------------------------------------------------------------------------------------- |
 | `traffic.rs`           | 4     | First-call zero rates; history accumulation; 60-sample window cap; eviction of dropped interfaces                         |
-| `connections.rs`       | 8     | `parse_ss_output`, `parse_nettop_output`, `parse_lsof`, RTT merge, `top_connections` ranking                              |
+| `connections.rs`       | 19    | `parse_ss_output` (+hidden users, non-ESTAB states, short rows), `parse_nettop_output` (+zero-RTT skip, multi-`ms` tokens), `parse_lsof_output` (UDP, IPv6 brackets, multi-socket processes), RTT merge, `top_connections` ranking |
 | `process_bandwidth.rs` | 5     | Proportional split, ranking by combined rate, `max` truncation, empty-input guards                                        |
-| `network_intel.rs`     | 10    | Each of the four detectors; DNS analytics aggregation; latency bucketing; bandwidth alert state machine; `split_host_port` |
-| `health.rs`            | 8     | `parse_loss` (zero / partial / full), `parse_avg_rtt`, `RttHistory` window cap, `Option<f64>` gap preservation            |
+| `network_intel.rs`     | 21    | Each detector; DNS analytics + latency bucketing; bandwidth clear-ratio recovery; per-interface threshold isolation; alert-history cap at 100; port-scan isolation per source IP; `split_host_port` |
+| `health.rs`            | 10    | `parse_loss` (zero / partial / full / empty), `parse_avg_rtt` (Linux + macOS), `RttHistory` window cap + None gap preservation, live loopback smoke test |
 | `system.rs`            | 14    | `parse_proc_loadavg`, `parse_proc_meminfo` (with/without `MemAvailable`), `parse_proc_swap`, `parse_vm_stat`, `parse_macos_swapusage`, `parse_proc_cpuinfo_model` |
 | `config.rs`            | 11    | `parse_default_gateway_ip_route`, `parse_default_gateway_netstat` (Linux + macOS formats), `parse_first_nameserver` (comments, indent, keyword-prefix safety) |
 | `disk.rs`              | 13    | `parse_proc_mounts` (real devices, virtual FS skip, snap/loop filtering), `parse_macos_mount` (root, firmlink skip), `parse_proc_diskstats` (sector summing, loop/ram/dm-* skip) |
@@ -57,7 +57,7 @@ cargo test --package netwatch-sdk -- --nocapture    # see println! output
 
 ## Measuring coverage
 
-CI runs `cargo-llvm-cov` on every push and uploads an `lcov.info` artifact. The job fails if line coverage drops below **70 %** (current baseline is ~76 %, so there's modest headroom).
+CI runs `cargo-llvm-cov` on every push and uploads an `lcov.info` artifact. The job fails if line coverage drops below **78 %** (current baseline is ~82 %, so there's modest headroom).
 
 To reproduce locally:
 
@@ -73,14 +73,14 @@ Per-file baseline at the time of writing:
 | --------------------------------- | -----: |
 | `collectors/process_bandwidth.rs` |  99 %  |
 | `collectors/traffic.rs`           |  94 %  |
+| `collectors/connections.rs`       |  89 %  |
+| `collectors/network_intel.rs`     |  85 %  |
 | `collectors/config.rs`            |  85 %  |
 | `collectors/disk.rs`              |  84 %  |
-| `collectors/connections.rs`       |  78 %  |
-| `collectors/network_intel.rs`     |  74 %  |
-| `collectors/health.rs`            |  65 %  |
+| `collectors/health.rs`            |  79 %  |
 | `collectors/system.rs`            |  62 %  |
 | `platform/linux.rs`               |   0 %  |
-| **Total**                         | **76 %** |
+| **Total**                         | **82 %** |
 
 `platform/linux.rs` is at 0 % because nothing in the test suite calls `collect_interface_stats()` directly — `traffic` tests construct an `InterfaceStats` map by hand. That's by design: platform shims are exercised by the integration suite in the agent, not by SDK unit tests.
 

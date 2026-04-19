@@ -4,6 +4,7 @@ use std::process::Command;
 /// Rolling window size for gateway/DNS RTT history, in samples.
 pub const RTT_HISTORY_LEN: usize = 60;
 
+#[derive(Debug, Clone)]
 pub struct PingResult {
     pub rtt_ms: Option<f64>,
     pub loss_pct: f64,
@@ -168,5 +169,56 @@ mod tests {
         h.push(None);
         h.push(Some(20.0));
         assert_eq!(h.snapshot(), vec![Some(10.0), None, Some(20.0)]);
+    }
+
+    #[test]
+    fn rtt_history_is_empty_on_construction() {
+        let h = RttHistory::new();
+        assert!(h.is_empty());
+        assert_eq!(h.len(), 0);
+        assert!(h.snapshot().is_empty());
+    }
+
+    #[test]
+    fn parse_loss_falls_back_when_no_loss_line_present() {
+        // No "packet loss" marker → safe default of 100% (assume probe
+        // failed rather than silently reporting 0).
+        assert_eq!(parse_loss("PING 1.1.1.1: 3 packets"), 100.0);
+    }
+
+    #[test]
+    fn parse_avg_rtt_handles_macos_style_prefix() {
+        // macOS omits the "rtt" prefix that Linux uses.
+        let output = "round-trip min/avg/max/stddev = 1.2/3.4/5.6/0.1 ms";
+        assert_eq!(parse_avg_rtt(output), Some(3.4));
+    }
+
+    // ── Live smoke test (requires `ping` + loopback) ────────────────────
+
+    /// Exercise the end-to-end path against 127.0.0.1 so we know
+    /// `run_ping` still talks to the system `ping` binary and parses its
+    /// real output. Loopback ping is universally available on dev hosts
+    /// and on GitHub-hosted runners; on rare sandboxed environments where
+    /// `ping` is missing, the function itself falls back to
+    /// `loss_pct = 100.0, rtt_ms = None`, so we assert only that one of
+    /// those shapes is returned — never a panic.
+    #[test]
+    fn run_ping_smoke_test_against_loopback() {
+        let result = run_ping("127.0.0.1");
+        // Either ping succeeded (loss 0–50%, rtt present) or the binary
+        // was missing / blocked (loss 100%, rtt None). Reject anything
+        // in between, which would indicate a parsing regression.
+        if result.loss_pct <= 50.0 {
+            assert!(
+                result.rtt_ms.is_some(),
+                "loopback ping reported low loss but no rtt_ms: {result:?}"
+            );
+        } else {
+            assert!(
+                result.rtt_ms.is_none(),
+                "high-loss ping should have rtt_ms = None: {result:?}"
+            );
+            assert!((result.loss_pct - 100.0).abs() < f64::EPSILON);
+        }
     }
 }

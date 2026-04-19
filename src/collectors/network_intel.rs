@@ -84,12 +84,14 @@ impl DnsAnalytics {
 
 // ── Events fed from other collectors ───────────────────────
 
+#[derive(Debug, Clone)]
 pub struct ConnAttemptEvent {
     pub src_ip: String,
     pub dst_ip: String,
     pub dst_port: u16,
 }
 
+#[derive(Debug, Clone)]
 pub struct DnsQueryEvent {
     pub txid: u16,
     pub client_ip: String,
@@ -97,6 +99,7 @@ pub struct DnsQueryEvent {
     pub qname: String,
 }
 
+#[derive(Debug, Clone)]
 pub struct DnsResponseEvent {
     pub txid: u16,
     pub client_ip: String,
@@ -104,6 +107,7 @@ pub struct DnsResponseEvent {
     pub rcode: u8,
 }
 
+#[derive(Debug, Clone)]
 pub struct InterfaceRateEvent {
     pub iface: String,
     pub rx_bps: u64,
@@ -758,5 +762,215 @@ mod tests {
     fn dns_analytics_is_empty_when_no_activity() {
         let intel = NetworkIntelCollector::new();
         assert!(intel.dns_analytics().is_empty());
+    }
+
+    // ── Lifecycle / state-machine coverage ───────────────────────────────
+
+    #[test]
+    fn bandwidth_state_clears_when_rate_drops_below_ratio() {
+        let mut intel = NetworkIntelCollector::new();
+        let over = InterfaceRateEvent {
+            iface: "eth0".into(),
+            rx_bps: 200_000_000,
+            tx_bps: 0,
+        };
+        // Two consecutive over-threshold samples → alert fires once.
+        intel.on_interface_rate(over.clone());
+        intel.on_interface_rate(over.clone());
+        assert_eq!(intel.active_alerts().len(), 1);
+
+        // A third over-threshold sample while `active` is set: no new alert.
+        intel.on_interface_rate(over.clone());
+        assert_eq!(intel.active_alerts().len(), 1);
+
+        // Drop below BW_ALERT_CLEAR_RATIO (0.9) × threshold to reset state.
+        // Default threshold is 100MB/s → clear ratio = 90MB/s.
+        intel.on_interface_rate(InterfaceRateEvent {
+            iface: "eth0".into(),
+            rx_bps: 80_000_000,
+            tx_bps: 0,
+        });
+
+        // State was reset — two new over-threshold samples fire a *second* alert.
+        intel.on_interface_rate(over.clone());
+        intel.on_interface_rate(over);
+        assert_eq!(intel.active_alerts().len(), 2);
+        assert!(intel
+            .active_alerts()
+            .iter()
+            .all(|a| a.category == AlertCategory::Bandwidth));
+    }
+
+    #[test]
+    fn bandwidth_alert_respects_custom_threshold() {
+        let mut intel = NetworkIntelCollector::new();
+        intel.set_bandwidth_threshold(10_000_000); // 10 MB/s
+        let rate = InterfaceRateEvent {
+            iface: "eth0".into(),
+            rx_bps: 15_000_000,
+            tx_bps: 0,
+        };
+        intel.on_interface_rate(rate.clone());
+        intel.on_interface_rate(rate);
+        assert_eq!(intel.active_alerts().len(), 1);
+    }
+
+    #[test]
+    fn bandwidth_threshold_applied_per_interface() {
+        let mut intel = NetworkIntelCollector::new();
+        let over = |iface: &str| InterfaceRateEvent {
+            iface: iface.into(),
+            rx_bps: 200_000_000,
+            tx_bps: 0,
+        };
+        intel.on_interface_rate(over("eth0"));
+        intel.on_interface_rate(over("eth0"));
+        intel.on_interface_rate(over("wlan0"));
+        intel.on_interface_rate(over("wlan0"));
+        assert_eq!(intel.active_alerts().len(), 2);
+    }
+
+    #[test]
+    fn dns_response_without_matching_query_is_ignored() {
+        let mut intel = NetworkIntelCollector::new();
+        // Response with no prior query — shouldn't panic, shouldn't bucket
+        // a latency since there's no start time.
+        intel.on_dns_response(DnsResponseEvent {
+            txid: 99,
+            client_ip: "1.1.1.1".into(),
+            server_ip: "8.8.8.8".into(),
+            rcode: 0,
+        });
+        let a = intel.dns_analytics();
+        assert_eq!(a.total_responses, 1);
+        assert_eq!(a.latency_buckets.iter().sum::<u64>(), 0);
+    }
+
+    #[test]
+    fn dns_tunnel_alert_via_high_unique_subdomain_rate() {
+        let mut intel = NetworkIntelCollector::new();
+        // >50 queries to a single parent with >30 unique subdomain prefixes.
+        for i in 0..60 {
+            intel.on_dns_query(DnsQueryEvent {
+                txid: i as u16,
+                client_ip: "10.0.0.1".into(),
+                server_ip: "8.8.8.8".into(),
+                qname: format!("{i:04}.tunnel.test"),
+            });
+        }
+        let alerts = intel.active_alerts();
+        assert!(
+            alerts
+                .iter()
+                .any(|a| a.category == AlertCategory::DnsTunnel),
+            "expected at least one DnsTunnel alert, got {alerts:?}"
+        );
+    }
+
+    #[test]
+    fn port_scan_triggers_once_per_source_ip() {
+        let mut intel = NetworkIntelCollector::new();
+        for port in 1..=25 {
+            intel.on_conn_attempt(ConnAttemptEvent {
+                src_ip: "192.168.1.100".into(),
+                dst_ip: "10.0.0.1".into(),
+                dst_port: port,
+            });
+        }
+        // Once the alert has fired, further connections from the same IP
+        // don't multiply alerts — the state machine marks the IP as alerted.
+        for port in 26..=50 {
+            intel.on_conn_attempt(ConnAttemptEvent {
+                src_ip: "192.168.1.100".into(),
+                dst_ip: "10.0.0.1".into(),
+                dst_port: port,
+            });
+        }
+        let scan_alerts: Vec<_> = intel
+            .active_alerts()
+            .into_iter()
+            .filter(|a| a.category == AlertCategory::PortScan)
+            .collect();
+        assert_eq!(scan_alerts.len(), 1);
+    }
+
+    #[test]
+    fn port_scan_isolated_per_source_ip() {
+        let mut intel = NetworkIntelCollector::new();
+        for src in &["192.168.1.10", "192.168.1.11", "192.168.1.12"] {
+            for port in 1..=25 {
+                intel.on_conn_attempt(ConnAttemptEvent {
+                    src_ip: (*src).into(),
+                    dst_ip: "10.0.0.1".into(),
+                    dst_port: port,
+                });
+            }
+        }
+        let scan_alerts: Vec<_> = intel
+            .active_alerts()
+            .into_iter()
+            .filter(|a| a.category == AlertCategory::PortScan)
+            .collect();
+        assert_eq!(scan_alerts.len(), 3);
+    }
+
+    #[test]
+    fn alert_history_caps_at_100() {
+        let mut intel = NetworkIntelCollector::new();
+        intel.set_bandwidth_threshold(1);
+        // Each full "two over + one under" cycle produces one alert. Run 120.
+        for i in 0..120 {
+            let iface = format!("iface{i}");
+            intel.on_interface_rate(InterfaceRateEvent {
+                iface: iface.clone(),
+                rx_bps: 1_000_000,
+                tx_bps: 0,
+            });
+            intel.on_interface_rate(InterfaceRateEvent {
+                iface,
+                rx_bps: 1_000_000,
+                tx_bps: 0,
+            });
+        }
+        assert_eq!(intel.alert_history().len(), 100);
+    }
+
+    #[test]
+    fn tick_is_safe_on_a_fresh_collector() {
+        let mut intel = NetworkIntelCollector::new();
+        intel.tick(); // Must not panic on empty state.
+        intel.tick();
+        assert!(intel.active_alerts().is_empty());
+    }
+
+    #[test]
+    fn dns_analytics_buckets_latency_by_elapsed_time() {
+        let mut intel = NetworkIntelCollector::new();
+        intel.on_dns_query(DnsQueryEvent {
+            txid: 1,
+            client_ip: "10.0.0.1".into(),
+            server_ip: "8.8.8.8".into(),
+            qname: "example.com".into(),
+        });
+        // Immediate response → lands in the first (<5ms) bucket.
+        intel.on_dns_response(DnsResponseEvent {
+            txid: 1,
+            client_ip: "10.0.0.1".into(),
+            server_ip: "8.8.8.8".into(),
+            rcode: 0,
+        });
+        let a = intel.dns_analytics();
+        // Sum of all buckets should equal number of matched responses.
+        assert_eq!(a.latency_buckets.iter().sum::<u64>(), 1);
+        // The first bucket (<5ms) is where an immediate response lands.
+        assert_eq!(a.latency_buckets[0], 1);
+    }
+
+    #[test]
+    fn extract_base_domain_handles_single_label_and_trailing_dot() {
+        // Single-label inputs are returned as-is.
+        assert_eq!(extract_base_domain("host"), "host");
+        // Trailing dot is stripped before picking the last two labels.
+        assert_eq!(extract_base_domain("a.b.c.d."), "c.d");
     }
 }

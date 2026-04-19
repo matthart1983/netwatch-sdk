@@ -309,6 +309,7 @@ fn parse_ss_process(field: &str) -> (Option<u32>, Option<String>) {
 }
 
 #[cfg(target_os = "macos")]
+#[cfg(target_os = "macos")]
 fn parse_lsof() -> Vec<ConnectionDetail> {
     let Ok(output) = std::process::Command::new("lsof")
         .args(["-i", "-n", "-P", "-F", "pcPtTn"])
@@ -316,8 +317,19 @@ fn parse_lsof() -> Vec<ConnectionDetail> {
     else {
         return Vec::new();
     };
+    parse_lsof_output(&String::from_utf8_lossy(&output.stdout))
+}
 
-    let text = String::from_utf8_lossy(&output.stdout);
+/// Parse the `-F pcPtTn` "field output" format produced by
+/// `lsof -i -n -P -F pcPtTn`. Each logical record consists of lines
+/// tagged by a single-character code: `p` = pid (starts a process group),
+/// `c` = command, `f` = file descriptor (starts a file within the process),
+/// `P` = protocol, `T` = extra (we only care about `TST=…` for TCP state),
+/// `n` = network address pair `local->remote` (or just `local` for UDP).
+///
+/// Pure function — extracted so we can exercise the format-parsing logic
+/// from any host, not just macOS where the `lsof` binary is reachable.
+pub(crate) fn parse_lsof_output(text: &str) -> Vec<ConnectionDetail> {
     let mut connections = Vec::new();
 
     let mut pid: Option<u32> = None;
@@ -399,15 +411,14 @@ fn parse_lsof() -> Vec<ConnectionDetail> {
                 }
             }
             b'n' => {
+                // Strip IPv6 brackets anywhere in the address, not just at
+                // the edges — `[fe80::1]:22` has `]` in the middle, so
+                // `trim_matches` would leave it intact.
                 if let Some(arrow_pos) = value.find("->") {
-                    local_addr = value[..arrow_pos]
-                        .trim_matches(|c| c == '[' || c == ']')
-                        .to_string();
-                    remote_addr = value[arrow_pos + 2..]
-                        .trim_matches(|c| c == '[' || c == ']')
-                        .to_string();
+                    local_addr = value[..arrow_pos].replace(['[', ']'], "");
+                    remote_addr = value[arrow_pos + 2..].replace(['[', ']'], "");
                 } else {
-                    local_addr = value.to_string();
+                    local_addr = value.replace(['[', ']'], "");
                     remote_addr = "*:*".to_string();
                 };
                 has_network = true;
@@ -579,5 +590,190 @@ tcp6 fe80::1%utun4.1024<->fe80::2%utun4.1024  utun4  Established  0 0 0 0 0  12.
             })
             .collect();
         assert_eq!(top_connections(conns, 10).len(), 10);
+    }
+
+    // ── parse_lsof_output ────────────────────────────────────────────────
+
+    #[test]
+    fn parse_lsof_output_extracts_established_tcp() {
+        // Format: each record is a sequence of single-char-tagged lines.
+        // `p` begins a process; `f` begins a file within it; values of tag
+        // letters that appear after `f` belong to that file.
+        let sample = "\
+p100
+ccurl
+f3
+PTCP
+TST=ESTABLISHED
+n10.0.0.1:54321->93.184.216.34:443
+";
+        let conns = parse_lsof_output(sample);
+        assert_eq!(conns.len(), 1);
+        assert_eq!(conns[0].protocol, "TCP");
+        assert_eq!(conns[0].pid, Some(100));
+        assert_eq!(conns[0].process_name.as_deref(), Some("curl"));
+        assert_eq!(conns[0].state, "ESTABLISHED");
+        assert_eq!(conns[0].local_addr, "10.0.0.1:54321");
+        assert_eq!(conns[0].remote_addr, "93.184.216.34:443");
+    }
+
+    #[test]
+    fn parse_lsof_output_handles_udp_without_remote() {
+        // UDP sockets use `n<local>` with no `->`; we fill remote with `*:*`.
+        let sample = "\
+p200
+cdnsmasq
+f5
+PUDP
+n0.0.0.0:53
+";
+        let conns = parse_lsof_output(sample);
+        assert_eq!(conns.len(), 1);
+        assert_eq!(conns[0].protocol, "UDP");
+        assert_eq!(conns[0].remote_addr, "*:*");
+        assert_eq!(conns[0].state, "");
+    }
+
+    #[test]
+    fn parse_lsof_output_strips_ipv6_brackets() {
+        let sample = "\
+p300
+cssh
+f3
+PTCP
+TST=ESTABLISHED
+n[fe80::1]:22->[fe80::2]:44444
+";
+        let conns = parse_lsof_output(sample);
+        assert_eq!(conns.len(), 1);
+        // Brackets stripped so downstream comparison with ss/nettop output
+        // matches.
+        assert_eq!(conns[0].local_addr, "fe80::1:22");
+        assert_eq!(conns[0].remote_addr, "fe80::2:44444");
+    }
+
+    #[test]
+    fn parse_lsof_output_emits_multiple_sockets_per_process() {
+        // Same process (nginx, pid 400) with two open sockets — emit both.
+        let sample = "\
+p400
+cnginx
+f7
+PTCP
+TST=LISTEN
+n0.0.0.0:80
+f8
+PTCP
+TST=ESTABLISHED
+n10.0.0.1:80->10.0.0.99:50000
+";
+        let conns = parse_lsof_output(sample);
+        assert_eq!(conns.len(), 2);
+        assert_eq!(conns[0].state, "LISTEN");
+        assert_eq!(conns[1].state, "ESTABLISHED");
+        assert!(conns.iter().all(|c| c.pid == Some(400)));
+        assert!(conns
+            .iter()
+            .all(|c| c.process_name.as_deref() == Some("nginx")));
+    }
+
+    #[test]
+    fn parse_lsof_output_ignores_unknown_tags_and_blank_lines() {
+        let sample = "\
+p500
+
+ccurl
+X-unknown-tag
+f3
+PTCP
+TST=ESTABLISHED
+n10.0.0.1:1->10.0.0.2:2
+";
+        let conns = parse_lsof_output(sample);
+        assert_eq!(conns.len(), 1);
+        assert_eq!(conns[0].process_name.as_deref(), Some("curl"));
+    }
+
+    #[test]
+    fn parse_lsof_output_skips_records_without_network() {
+        // A process may have open files with no `n<addr>` line. Nothing
+        // about that record reaches the connection list.
+        let sample = "\
+p600
+cfoo
+f1
+PTCP
+TST=ESTABLISHED
+";
+        assert!(parse_lsof_output(sample).is_empty());
+    }
+
+    // ── parse_ss_output edge cases ──────────────────────────────────────
+
+    #[test]
+    fn parse_ss_output_skips_rows_with_fewer_than_six_columns() {
+        let text = "\
+Netid State    Recv-Q Send-Q Local Address:Port  Peer Address:Port Process
+tcp   ESTAB    0      0                                          users:((\"x\",pid=1,fd=3))
+tcp   ESTAB    0      0      10.0.0.1:1          10.0.0.2:2       users:((\"ok\",pid=2,fd=3))
+";
+        let conns = parse_ss_output(text);
+        assert_eq!(conns.len(), 1);
+        assert_eq!(conns[0].process_name.as_deref(), Some("ok"));
+    }
+
+    #[test]
+    fn parse_ss_output_without_users_field_has_no_pid() {
+        // Running `ss` as an unprivileged user hides users:(...) for
+        // sockets owned by other users.
+        let text = "\
+Netid State    Recv-Q Send-Q Local Address:Port  Peer Address:Port
+tcp   ESTAB    0      0      10.0.0.1:1          10.0.0.2:443
+";
+        let conns = parse_ss_output(text);
+        assert_eq!(conns.len(), 1);
+        assert_eq!(conns[0].pid, None);
+        assert_eq!(conns[0].process_name, None);
+    }
+
+    #[test]
+    fn parse_ss_output_preserves_non_estab_state_strings() {
+        // Anything other than ESTAB is kept verbatim so the UI can
+        // distinguish TIME_WAIT from CLOSE_WAIT etc.
+        let text = "\
+Netid State      Recv-Q Send-Q Local Address:Port Peer Address:Port Process
+tcp   TIME-WAIT  0      0      10.0.0.1:1         10.0.0.2:2         users:((\"a\",pid=1,fd=3))
+tcp   CLOSE-WAIT 0      0      10.0.0.1:3         10.0.0.2:4         users:((\"b\",pid=2,fd=3))
+";
+        let conns = parse_ss_output(text);
+        assert_eq!(conns.len(), 2);
+        assert_eq!(conns[0].state, "TIME-WAIT");
+        assert_eq!(conns[1].state, "CLOSE-WAIT");
+    }
+
+    // ── parse_nettop_output edge cases ──────────────────────────────────
+
+    #[test]
+    fn parse_nettop_ignores_fractional_zero_rtt() {
+        // "0.00 ms" rows are filter-rejected so we don't overwrite a
+        // real RTT on a subsequent refresh with a stale-zero sample.
+        let sample = "\
+tcp4 10.0.0.1:1<->10.0.0.2:2 en0 Established 0 0 0 0 0 0.00 ms 0 0
+";
+        assert!(parse_nettop_output(sample).is_empty());
+    }
+
+    #[test]
+    fn parse_nettop_picks_first_ms_token_on_line() {
+        // Some nettop builds emit multiple `X ms` columns; the first one
+        // is the RTT average (others are inter-arrival, jitter, etc.).
+        let sample = "\
+tcp4 10.0.0.1:1<->10.0.0.2:2 en0 Established 100 100 0 0 0 12.5 ms 45.0 ms 0 0
+";
+        let map = parse_nettop_output(sample);
+        let rtt = map
+            .get(&("10.0.0.1:1".into(), "10.0.0.2:2".into()))
+            .unwrap();
+        assert!((rtt - 12_500.0).abs() < 1.0);
     }
 }
