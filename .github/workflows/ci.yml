@@ -56,3 +56,54 @@ jobs:
         with:
           name: coverage-lcov
           path: lcov.info
+
+  ebpf-build:
+    # Builds the BPF programs with the pinned nightly + bpf-linker, stages
+    # the artifact via scripts/build-ebpf.sh, then rebuilds the SDK with
+    # `--features ebpf` so the embedded include_bytes! resolves to the
+    # real object. This proves Phase 1 wires up end-to-end without needing
+    # a privileged container or actually loading the program in the kernel
+    # (that's the future ebpf-integration job, not this one).
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # Stable toolchain for the userspace SDK build.
+      - uses: dtolnay/rust-toolchain@stable
+
+      # Nightly toolchain for the BPF crate. The channel here MUST match
+      # crates/ebpf-programs/rust-toolchain.toml. When you bump that file,
+      # bump this `toolchain:` value in lockstep so the cache key matches.
+      - name: Install nightly toolchain for BPF crate
+        uses: dtolnay/rust-toolchain@nightly
+        with:
+          toolchain: nightly-2026-01-15
+          components: rust-src,rustc-dev,llvm-tools-preview
+          targets: bpfel-unknown-none
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          # Separate cache from the test job so the nightly artifacts don't
+          # poison the stable build's cache.
+          shared-key: ebpf-build
+
+      - name: Install bpf-linker
+        # Builds against the host LLVM (`apt install` provides LLVM 18 on
+        # ubuntu-24.04 / 14 on ubuntu-22.04). bpf-linker is published on
+        # crates.io.
+        run: cargo install bpf-linker --locked
+
+      - name: Build BPF programs
+        run: scripts/build-ebpf.sh
+
+      - name: Confirm BPF object was produced
+        run: |
+          test -s target/bpf/netwatch_sdk_ebpf.o
+          file target/bpf/netwatch_sdk_ebpf.o
+          ls -la target/bpf/
+
+      - name: Build SDK with --features ebpf
+        run: cargo build --features ebpf
+
+      - name: Run SDK tests with --features ebpf
+        run: cargo test --features ebpf --lib
