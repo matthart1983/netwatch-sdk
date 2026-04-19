@@ -9,6 +9,22 @@ homepage = "https://github.com/matthart1983/netwatch-sdk"
 readme = "README.md"
 keywords = ["network", "monitoring", "observability", "sdk"]
 categories = ["network-programming", "api-bindings"]
+build = "build.rs"
+exclude = [
+    # Build-time-only sibling crates aren't shipped to crates.io.
+    "crates/ebpf-programs/**",
+    "crates/common/**",
+    "scripts/**",
+]
+
+[features]
+default = []
+# Enable the eBPF event source. Linux-only at runtime AND build time:
+# `aya` itself doesn't compile on non-Linux targets. The non-Linux side
+# of `EventSource` lives behind `#[cfg(target_os = "linux")]` and returns
+# `EbpfError::UnsupportedPlatform` so cross-platform binaries still build
+# with the feature enabled.
+ebpf = ["dep:netwatch-sdk-common", "dep:aya", "dep:aya-log"]
 
 [dependencies]
 serde = { version = "1", features = ["derive"] }
@@ -16,3 +32,22 @@ anyhow = "1"
 chrono = { version = "0.4", features = ["serde"] }
 uuid = { version = "1", features = ["v4", "serde"] }
 libc = "0.2"
+
+# Cross-platform optional deps for the `ebpf` feature.
+netwatch-sdk-common = { path = "crates/common", version = "0.1", features = ["user"], optional = true }
+
+# Linux-only optional deps for the `ebpf` feature. Cargo silently skips
+# these when the target doesn't match, so `--features ebpf` builds clean
+# on macOS / Windows (the runtime path returns UnsupportedPlatform).
+[target.'cfg(target_os = "linux")'.dependencies]
+aya = { version = "0.13", optional = true }
+aya-log = { version = "0.2", optional = true }
+
+[workspace]
+members = ["crates/common"]
+# crates/ebpf-programs is intentionally NOT a workspace member: it requires
+# a nightly toolchain and the `bpfel-unknown-none` target, and must be
+# built independently via `scripts/build-ebpf.sh`. Excluding it here stops
+# stable `cargo build` / `cargo check` at the repo root from trying to
+# compile it.
+exclude = ["crates/ebpf-programs"]

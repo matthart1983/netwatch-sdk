@@ -1,0 +1,10 @@
+[build]
+target = "bpfel-unknown-none"
+
+[target.bpfel-unknown-none]
+rustflags = [
+    "-C", "link-arg=--btf",
+]
+
+[unstable]
+build-std = ["core"]

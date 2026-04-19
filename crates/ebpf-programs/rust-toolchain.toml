@@ -1,0 +1,7 @@
+# aya BPF programs need nightly for the bpfel-unknown-none target and
+# build-std support. Pin a known-good nightly so CI is reproducible.
+# Bump intentionally and verify locally before pushing.
+[toolchain]
+channel = "nightly-2026-01-15"
+components = ["rust-src", "rustc-dev", "llvm-tools-preview"]
+targets = ["bpfel-unknown-none"]

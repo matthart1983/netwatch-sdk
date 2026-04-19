@@ -1,8 +1,42 @@
 # Plan — Full eBPF support
 
-> Status: proposal, not started.
+> Status: **Phase 1 scaffolding shipped**; real BPF compilation pending a Linux session.
 > Owner: TBD.
 > Scope: SDK only. Cloud and dashboard changes are tracked separately.
+
+## Locked decisions
+
+| Decision        | Choice                                                                |
+| --------------- | --------------------------------------------------------------------- |
+| Loader          | **`aya`** (pure-Rust, CO-RE/BTF, no `libbpf` C dep)                   |
+| Kernel floor    | **≥ 5.10** (reliable BTF and `CAP_BPF`)                               |
+| Event delivery  | **`std::sync::mpsc::Receiver<EbpfEvent>`** (sync, single reader)      |
+| Workspace       | **Two extra crates** under `crates/`: `common` (shared no_std types) and `ebpf-programs` (BPF target, excluded from default workspace) |
+| Cargo feature   | **`ebpf`** — opt-in, target-gates `aya` to Linux so cross-platform builds stay clean |
+| BPF artifact    | Built by `scripts/build-ebpf.sh` into `target/bpf/`, embedded by `build.rs` via `include_bytes!` |
+
+## What shipped (this session)
+
+- `crates/common/` — `netwatch-sdk-common` crate. `#![no_std]` event types (`ConnectV4Event`, `EventKind`) shared by BPF and userspace. `repr(C)` + `Copy` so the BPF program can write directly into a ring buffer and userspace can `read_unaligned` it back.
+- `crates/ebpf-programs/` — `netwatch-sdk-ebpf-programs` crate. `#![no_std] #![no_main]` with a real `tcp_v4_connect` kprobe (aya-ebpf). Pinned nightly toolchain via `rust-toolchain.toml`, BPF target via `.cargo/config.toml`. Excluded from the parent workspace so a stable `cargo build` at the repo root never touches it.
+- `src/ebpf/` — userspace `EventSource` API, gated by `#[cfg(feature = "ebpf")]`.
+  - `mod.rs` — public re-exports.
+  - `event.rs` — `EbpfEvent` enum, `ConnectEvent` struct (host-byte-order address/port, decoded `comm`), pure decoder with portable endianness handling and a fixture test.
+  - `source.rs` — `EventSource::new()` returning `(Self, Receiver<EbpfEvent>)`. Linux implementation loads the embedded BPF object, attaches the kprobe, takes ownership of the `EVENTS` ring buffer, and spawns a reader thread that pushes decoded events. Non-Linux returns `EbpfError::UnsupportedPlatform`.
+- `build.rs` — always writes `$OUT_DIR/netwatch_sdk_ebpf.o` (empty if `target/bpf/` is empty); `include_bytes!` therefore always compiles, and an empty file becomes `EbpfError::BpfObjectMissing` at runtime.
+- `scripts/build-ebpf.sh` — drives `cargo +nightly build --target bpfel-unknown-none --release` in the BPF crate, copies the artifact into `target/bpf/`. Checks for `rustup` and `bpf-linker` upfront with helpful errors.
+- `Cargo.toml` — workspace converted; `aya` and `aya-log` declared under `[target.'cfg(target_os = "linux")'.dependencies]` so `--features ebpf` builds on macOS/Windows without dragging in unbuildable Linux-only deps.
+
+**Verification on macOS:** `cargo test` (default) → 73 pass. `cargo test --features ebpf` → 78 pass (5 new ebpf tests). The actual BPF program hasn't been compiled yet (needs Linux + nightly + `bpf-linker`), so `EventSource::new()` would return `BpfObjectMissing` at runtime today.
+
+## Known limitations / next-session work
+
+- **CO-RE not yet wired in the kprobe.** The kprobe reads `struct sock` fields at hard-coded offsets that match a 5.15 reference kernel. This works for the proof of concept but won't be portable across kernels until we switch to aya's CO-RE relocations.
+- **Source port is always 0.** It lives at a different offset (`inet_sock->inet_sport`) than the destination (`__sk_common.skc_dport`) and reading it cleanly needs CO-RE.
+- **Reader thread is a busy-poll loop with a 5 ms sleep.** Replace with `epoll`-based wakeup once Phase 2 is on the board.
+- **No CI for the BPF build.** Add a `--privileged` Docker step or a self-hosted Linux runner that installs `bpf-linker`, runs `scripts/build-ebpf.sh`, and runs the integration test inside an Ubuntu 22.04 container with `--cap-add BPF --cap-add PERFMON`.
+
+## Non-goals
 
 ## Why
 
@@ -151,12 +185,12 @@ netwatch-sdk = { version = "0.2", features = ["ebpf"] }
 
 `netwatch-agent` flips the feature on by default; third-party SDK consumers (researchers, custom dashboards) get the polling path with no Linux-kernel headers in their build.
 
-## Decision log (to be updated as we make choices)
+## Decision log
 
-- _Loader library:_ `aya` (preferred) vs `libbpf-rs`. Open.
-- _Kernel floor:_ 5.10 (preferred for `CAP_BPF`). Open.
-- _Ring buffer model:_ one per program (preferred) vs shared. Open.
-- _Workspace layout:_ single workspace with sibling BPF crate (preferred). Open.
+- _Loader library:_ **aya** (locked, in code).
+- _Kernel floor:_ **5.10** (locked).
+- _Ring buffer model:_ **one per program** — Phase 1 only has one BPF program so this is moot today. When phase 2 lands a second program, give it its own ring buffer.
+- _Workspace layout:_ **two extra crates** under `crates/` (`common`, `ebpf-programs`). The BPF crate is intentionally NOT a workspace member because it requires a different toolchain.
 
 ## Sequencing relative to other work
 

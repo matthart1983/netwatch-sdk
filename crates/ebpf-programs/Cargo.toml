@@ -1,0 +1,40 @@
+[package]
+name = "netwatch-sdk-ebpf-programs"
+version = "0.1.0"
+edition = "2021"
+publish = false
+description = "BPF programs loaded by the netwatch-sdk eBPF event source. Built with a nightly toolchain via scripts/build-ebpf.sh; not built by stable cargo."
+
+# This crate is built ONLY with `cargo +<nightly> build --target
+# bpfel-unknown-none --release`. It is intentionally excluded from the
+# parent workspace so a stable host build doesn't try to compile it.
+[package.metadata]
+build-cmd = "scripts/build-ebpf.sh"
+
+[lib]
+# We compile to a static `.a` and link the produced object via the linker
+# script that aya-ebpf-macros expects. `crate-type = ["lib"]` is the
+# default, but we make it explicit for clarity.
+path = "src/main.rs"
+
+[[bin]]
+name = "netwatch_sdk_ebpf"
+path = "src/main.rs"
+
+[dependencies]
+aya-ebpf = "0.1"
+aya-log-ebpf = "0.1"
+netwatch-sdk-common = { path = "../common" }
+
+[profile.dev]
+panic = "abort"
+opt-level = 3
+debug = false
+incremental = false
+
+[profile.release]
+panic = "abort"
+opt-level = 3
+debug = false
+codegen-units = 1
+lto = true

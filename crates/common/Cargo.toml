@@ -1,0 +1,24 @@
+[package]
+name = "netwatch-sdk-common"
+version = "0.1.0"
+edition = "2021"
+description = "Shared event types for netwatch-sdk eBPF programs and userspace consumers. Internal to the netwatch-sdk workspace."
+license = "MIT"
+repository = "https://github.com/matthart1983/netwatch-sdk"
+publish = false
+
+[dependencies]
+# All optional, all gated. The crate stays no_std-compatible by default so
+# BPF programs (no_std no_main) can depend on it without dragging in std.
+
+[features]
+default = []
+# Enables std::fmt::Debug and serde derives. Userspace consumers turn this
+# on; the BPF crate leaves it off.
+user = ["dep:serde"]
+
+[dependencies.serde]
+version = "1"
+default-features = false
+features = ["derive"]
+optional = true
