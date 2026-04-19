@@ -73,13 +73,18 @@ jobs:
 
       # Nightly toolchain for the BPF crate. The channel here MUST match
       # crates/ebpf-programs/rust-toolchain.toml. When you bump that file,
-      # bump this `toolchain:` value in lockstep so the cache key matches.
+      # bump this `toolchain:` value in lockstep.
+      #
+      # Note: bpfel-unknown-none is a tier-3 target — there is no
+      # rustup-installable rust-std for it. We use `-Z build-std=core`
+      # (configured in crates/ebpf-programs/.cargo/config.toml) which
+      # builds `core` from `rust-src`, so we install rust-src here but
+      # NOT bpfel-unknown-none as a `target`.
       - name: Install nightly toolchain for BPF crate
         uses: dtolnay/rust-toolchain@nightly
         with:
           toolchain: nightly-2026-01-15
           components: rust-src,rustc-dev,llvm-tools-preview
-          targets: bpfel-unknown-none
 
       - uses: Swatinem/rust-cache@v2
         with:

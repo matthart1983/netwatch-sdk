@@ -563,7 +563,7 @@ impl NetworkIntelCollector {
 
         if self.domain_counts.len() > MAX_TRACKED_DOMAINS * 2 {
             let mut entries: Vec<(String, u32)> = self.domain_counts.drain().collect();
-            entries.sort_by(|a, b| b.1.cmp(&a.1));
+            entries.sort_by_key(|e| std::cmp::Reverse(e.1));
             entries.truncate(MAX_TRACKED_DOMAINS);
             self.domain_counts = entries.into_iter().collect();
         }

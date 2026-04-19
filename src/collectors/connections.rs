@@ -230,7 +230,10 @@ fn parse_linux_connections() -> Vec<ConnectionDetail> {
 }
 
 /// Parse the output of `ss -tunapi`. Pure function — no I/O, no platform
-/// dependencies — so we can unit-test it on any host.
+/// dependencies — so we can unit-test it on any host. Only called from
+/// the Linux collection path; on macOS the `dead_code` lint trips because
+/// non-test builds never reach the call site.
+#[allow(dead_code)]
 pub(crate) fn parse_ss_output(text: &str) -> Vec<ConnectionDetail> {
     let mut connections: Vec<ConnectionDetail> = Vec::new();
 
@@ -281,6 +284,7 @@ pub(crate) fn parse_ss_output(text: &str) -> Vec<ConnectionDetail> {
 
 /// Extract `rtt:X.Y` (milliseconds) from an `ss -i` continuation line and
 /// return it as microseconds. Returns None if not found or unparseable.
+#[allow(dead_code)]
 fn parse_ss_rtt_us(line: &str) -> Option<f64> {
     for token in line.split_whitespace() {
         if let Some(rest) = token.strip_prefix("rtt:") {
@@ -292,6 +296,7 @@ fn parse_ss_rtt_us(line: &str) -> Option<f64> {
     None
 }
 
+#[allow(dead_code)]
 fn parse_ss_process(field: &str) -> (Option<u32>, Option<String>) {
     // Format: users:(("process",pid=1234,fd=3))
     let name = field.split('"').nth(1).map(|s| s.to_string());

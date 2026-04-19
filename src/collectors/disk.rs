@@ -17,10 +17,10 @@ pub struct DiskIo {
 }
 
 /// A device-backed mount discovered from `/proc/mounts` or `mount`.
-/// Pure intermediate type — kept module-private so we can rework it later
-/// without affecting consumers.
+/// Pure intermediate type — public so the parsers' return type is namable
+/// from outside the module, but not part of the wire format.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct MountEntry {
+pub struct MountEntry {
     pub device: String,
     pub mount_point: String,
 }
@@ -158,6 +158,12 @@ pub fn parse_proc_diskstats(text: &str) -> Option<DiskIo> {
 ///
 /// Returns `None` if the syscall fails or the filesystem reports a zero size
 /// (which can happen for read-only system mounts on macOS).
+//
+// `libc::statvfs::f_frsize` is `u64` on macOS but `c_ulong` on Linux. We
+// uniformly cast to `u64` so the arithmetic below works on both — that
+// cast is a no-op on macOS, which clippy flags as unnecessary. Allowed
+// at function scope because the alternative (per-platform cfg) is noisier.
+#[allow(clippy::unnecessary_cast)]
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 fn stat_mount(entry: &MountEntry) -> Option<DiskUsage> {
     use std::ffi::CString;
@@ -309,12 +315,7 @@ overlay /var/lib/docker/overlay2/abc/merged overlay rw,relatime,lowerdir=/x 0 0
 
     #[test]
     fn proc_mounts_handles_blank_or_truncated_lines() {
-        let sample = "\
-
-/dev/sda1
-/dev/sda2 /boot
-/dev/sda3 / ext4 rw 0 0
-";
+        let sample = "\n/dev/sda1\n/dev/sda2 /boot\n/dev/sda3 / ext4 rw 0 0\n";
         let mounts = parse_proc_mounts(sample);
         assert_eq!(mounts.len(), 1);
         assert_eq!(mounts[0].device, "/dev/sda3");
