@@ -8,16 +8,18 @@ That's the whole thing — no fixtures, no test database, no env vars required. 
 
 ## What's covered
 
-About 40 unit tests, weighted toward parsing and state-machine logic. The shape of the suite:
+60 unit tests across 7 modules, weighted toward parsing and state-machine logic. The shape of the suite:
 
-| Module                     | Tests | What they actually exercise                                                                |
-| -------------------------- | ----: | ------------------------------------------------------------------------------------------ |
-| `traffic.rs`               | 4     | First-call zero rates; history accumulation; 60-sample window cap; eviction of dropped interfaces |
-| `connections.rs`           | 8     | `parse_ss_output`, `parse_nettop_output`, `parse_lsof`, RTT merge, `top_connections` ranking |
-| `process_bandwidth.rs`     | 5     | Proportional split, ranking by combined rate, `max` truncation, empty-input guards         |
-| `network_intel.rs`         | 12    | Each of the four detectors; DNS analytics aggregation; latency bucketing; bandwidth alert state machine; `split_host_port` |
-| `health.rs`                | 8     | `parse_loss` (zero / partial / full), `parse_avg_rtt`, `RttHistory` window cap, `Option<f64>` gap preservation |
-| `system.rs`, `disk.rs`, `config.rs` | 0 | Rely on syscall/libc behavior — covered by integration in the agent rather than here       |
+| Module                 | Tests | What they actually exercise                                                                                               |
+| ---------------------- | ----: | ------------------------------------------------------------------------------------------------------------------------- |
+| `traffic.rs`           | 4     | First-call zero rates; history accumulation; 60-sample window cap; eviction of dropped interfaces                         |
+| `connections.rs`       | 8     | `parse_ss_output`, `parse_nettop_output`, `parse_lsof`, RTT merge, `top_connections` ranking                              |
+| `process_bandwidth.rs` | 5     | Proportional split, ranking by combined rate, `max` truncation, empty-input guards                                        |
+| `network_intel.rs`     | 10    | Each of the four detectors; DNS analytics aggregation; latency bucketing; bandwidth alert state machine; `split_host_port` |
+| `health.rs`            | 8     | `parse_loss` (zero / partial / full), `parse_avg_rtt`, `RttHistory` window cap, `Option<f64>` gap preservation            |
+| `system.rs`            | 14    | `parse_proc_loadavg`, `parse_proc_meminfo` (with/without `MemAvailable`), `parse_proc_swap`, `parse_vm_stat`, `parse_macos_swapusage`, `parse_proc_cpuinfo_model` |
+| `config.rs`            | 11    | `parse_default_gateway_ip_route`, `parse_default_gateway_netstat` (Linux + macOS formats), `parse_first_nameserver` (comments, indent, keyword-prefix safety) |
+| `disk.rs`              | **0** | Pending — `/proc/mounts` and `mount` parsing should be extracted as pure functions and tested the same way                |
 
 ## Test conventions in this repo
 
@@ -48,9 +50,30 @@ cargo test --package netwatch-sdk -- --nocapture    # see println! output
 
 ## Coverage gaps worth knowing
 
-- **`system::*` and `disk::*` aren't unit-tested** — they're thin wrappers around platform APIs and tests would essentially mirror the implementation. The downstream agent integration test catches regressions.
+- **`disk::*` parsers are still inline** with the I/O — until they're extracted as pure functions like `system::parse_proc_meminfo`, they can't be unit-tested with fixtures. Same recipe: pull `parse_proc_diskstats(&str)` and `parse_mount_output(&str)` out, then add tests against captured output.
+- **`system::measure_cpu_usage` and `measure_cpu_per_core` aren't tested** because they sleep and read live `/proc/stat`. Hard to fixture without a clock abstraction.
 - **Live `connections::collect_connections` runs `ss`/`lsof`/`nettop` against the real machine.** The test asserts only "no panic; results are well-formed", because exact contents depend on the host.
 - **Cross-platform behaviour is verified by running CI on both Linux and macOS runners**, not by mocking each platform from the other.
+
+## Measuring coverage
+
+There's no coverage tool wired into CI today. The lightest-weight option is `cargo-llvm-cov` (works on Linux and macOS, no nightly required):
+
+```sh
+cargo install cargo-llvm-cov
+cargo llvm-cov --workspace --summary-only
+```
+
+Add it to CI by appending to `.github/workflows/ci.yml`:
+
+```yaml
+- name: Install cargo-llvm-cov
+  uses: taiki-e/install-action@cargo-llvm-cov
+- name: Coverage
+  run: cargo llvm-cov --workspace --summary-only
+```
+
+A nice baseline goal is 70 %+ on `collectors/*` (parsers and detectors) and not worrying about platform shims that can't be exercised cross-platform.
 
 ## Pre-commit hook (recommended)
 

@@ -253,8 +253,9 @@ impl NetworkIntelCollector {
         self.outstanding_dns.retain(|_, v| {
             now.duration_since(v.sent_at) < Duration::from_secs(DNS_OUTSTANDING_TIMEOUT_SECS)
         });
-        self.active_alerts
-            .retain(|a| now.duration_since(a.created_at) < Duration::from_secs(ACTIVE_ALERT_TTL_SECS));
+        self.active_alerts.retain(|a| {
+            now.duration_since(a.created_at) < Duration::from_secs(ACTIVE_ALERT_TTL_SECS)
+        });
     }
 
     // ── Event handlers ─────────────────────────────────────

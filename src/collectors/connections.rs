@@ -30,9 +30,7 @@ pub fn count_established_connections() -> u32 {
         .output();
     let Ok(output) = output else { return 0 };
     let text = String::from_utf8_lossy(&output.stdout);
-    text.lines()
-        .filter(|l| l.contains("ESTABLISHED"))
-        .count() as u32
+    text.lines().filter(|l| l.contains("ESTABLISHED")).count() as u32
 }
 
 #[cfg(not(any(target_os = "linux", target_os = "macos")))]
@@ -202,15 +200,16 @@ pub(crate) fn parse_nettop_output(text: &str) -> std::collections::HashMap<(Stri
         }
 
         // Find `<number> ms` somewhere later on the line.
-        let rtt_us = tokens[idx + 2..]
-            .windows(2)
-            .find_map(|w| {
-                if w[1] == "ms" {
-                    w[0].parse::<f64>().ok().filter(|&v| v > 0.0).map(|v| v * 1000.0)
-                } else {
-                    None
-                }
-            });
+        let rtt_us = tokens[idx + 2..].windows(2).find_map(|w| {
+            if w[1] == "ms" {
+                w[0].parse::<f64>()
+                    .ok()
+                    .filter(|&v| v > 0.0)
+                    .map(|v| v * 1000.0)
+            } else {
+                None
+            }
+        });
 
         if let Some(rtt_us) = rtt_us {
             map.insert((local.to_string(), remote.to_string()), rtt_us);
@@ -532,7 +531,10 @@ time                               interface     state     bytes_in   bytes_out 
             .expect("loopback row");
         assert!((lo - 1220.0).abs() < 0.1, "got {}", lo);
         let wan = map
-            .get(&("192.168.0.213:53077".to_string(), "17.57.145.38:5223".to_string()))
+            .get(&(
+                "192.168.0.213:53077".to_string(),
+                "17.57.145.38:5223".to_string(),
+            ))
             .copied()
             .expect("en0 row");
         assert!((wan - 154_160.0).abs() < 1.0, "got {}", wan);
