@@ -112,3 +112,55 @@ jobs:
 
       - name: Run SDK tests with --features ebpf
         run: cargo test --features ebpf --lib
+
+  ebpf-integration:
+    # Loads the compiled BPF program in the host kernel and asserts an
+    # end-to-end round-trip: a userspace TCP connect triggers the kprobe,
+    # the kernel writes an event into the ring buffer, and userspace
+    # decodes it via EventSource.
+    #
+    # GitHub-hosted ubuntu-latest runners allow sudo and have modern
+    # kernels with BTF, so this works without a self-hosted runner or
+    # `--privileged` Docker gymnastics. The build-and-run-as-root dance
+    # is:
+    #   1. Build the BPF object with the pinned nightly + bpf-linker.
+    #   2. Build the integration test binary as the runner user so
+    #      cargo's paths resolve normally.
+    #   3. Locate the emitted test binary, run it under sudo.
+    needs: ebpf-build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@nightly
+        with:
+          toolchain: nightly-2026-01-15
+          components: rust-src,rustc-dev,llvm-tools-preview
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: ebpf-integration
+
+      - name: Install bpf-linker
+        run: cargo install bpf-linker --locked
+
+      - name: Build BPF programs
+        run: scripts/build-ebpf.sh
+
+      - name: Build integration test binary (unprivileged)
+        run: cargo test --features ebpf --test ebpf_integration --no-run
+
+      - name: Locate the test binary
+        id: testbin
+        run: |
+          bin=$(cargo test --features ebpf --test ebpf_integration --no-run --message-format=json 2>/dev/null \
+                | jq -rs '.[] | select(.profile.test == true and .target.name == "ebpf_integration") | .executable' \
+                | tail -n1)
+          test -n "$bin" || { echo "could not locate ebpf_integration test binary"; exit 1; }
+          echo "bin=$bin" >> "$GITHUB_OUTPUT"
+          echo "locating $bin"
+
+      - name: Run integration test as root
+        # sudo preserves the existing PATH so ldconfig, etc. still work.
+        # --nocapture so the skip messages or assertion output show up.
+        run: sudo ${{ steps.testbin.outputs.bin }} --nocapture
