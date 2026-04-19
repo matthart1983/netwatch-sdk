@@ -65,6 +65,7 @@ See [`docs/architecture.md`](docs/architecture.md) for the full collection cycle
 - [**Extending**](docs/extending.md) — adding a new collector, a new alert detector, or a new platform.
 - [**Testing**](docs/testing.md) — running the suite and what's actually covered.
 - [**Publishing**](docs/publishing.md) — version bump, crates.io release.
+- **Roadmap** — [eBPF integration plan](docs/plans/ebpf.md) · [test-coverage plan](docs/plans/test-coverage.md)
 
 ## Platform support
 
