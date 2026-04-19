@@ -8,7 +8,7 @@ That's the whole thing — no fixtures, no test database, no env vars required. 
 
 ## What's covered
 
-99 unit tests across 8 modules, weighted toward parsing and state-machine logic. The shape of the suite:
+115 unit tests across 9 modules, weighted toward parsing and state-machine logic. The shape of the suite:
 
 | Module                 | Tests | What they actually exercise                                                                                               |
 | ---------------------- | ----: | ------------------------------------------------------------------------------------------------------------------------- |
@@ -17,9 +17,10 @@ That's the whole thing — no fixtures, no test database, no env vars required. 
 | `process_bandwidth.rs` | 5     | Proportional split, ranking by combined rate, `max` truncation, empty-input guards                                        |
 | `network_intel.rs`     | 21    | Each detector; DNS analytics + latency bucketing; bandwidth clear-ratio recovery; per-interface threshold isolation; alert-history cap at 100; port-scan isolation per source IP; `split_host_port` |
 | `health.rs`            | 10    | `parse_loss` (zero / partial / full / empty), `parse_avg_rtt` (Linux + macOS), `RttHistory` window cap + None gap preservation, live loopback smoke test |
-| `system.rs`            | 14    | `parse_proc_loadavg`, `parse_proc_meminfo` (with/without `MemAvailable`), `parse_proc_swap`, `parse_vm_stat`, `parse_macos_swapusage`, `parse_proc_cpuinfo_model` |
+| `system.rs`            | 25    | `parse_proc_loadavg`, `parse_proc_meminfo` (with/without `MemAvailable`), `parse_proc_swap`, `parse_vm_stat`, `parse_macos_swapusage`, `parse_proc_cpuinfo_model`, plus Phase 3 `parse_proc_stat_aggregate` / `_per_core` and `cpu_pct_from_samples` (busy, idle, reversed, rounding) |
 | `config.rs`            | 11    | `parse_default_gateway_ip_route`, `parse_default_gateway_netstat` (Linux + macOS formats), `parse_first_nameserver` (comments, indent, keyword-prefix safety) |
 | `disk.rs`              | 13    | `parse_proc_mounts` (real devices, virtual FS skip, snap/loop filtering), `parse_macos_mount` (root, firmlink skip), `parse_proc_diskstats` (sector summing, loop/ram/dm-* skip) |
+| `platform/linux.rs`    | 5     | `collect_interface_stats_from` driven against a tempfile-populated sysfs tree: counters + operstate, loopback-skip, missing-file defaults, operstate variants (up/down/unknown), missing-root error |
 
 ## Test conventions in this repo
 
@@ -57,7 +58,7 @@ cargo test --package netwatch-sdk -- --nocapture    # see println! output
 
 ## Measuring coverage
 
-CI runs `cargo-llvm-cov` on every push and uploads an `lcov.info` artifact. The job fails if line coverage drops below **78 %** (current baseline is ~82 %, so there's modest headroom).
+CI runs `cargo-llvm-cov` on every push and uploads an `lcov.info` artifact. The job fails if line coverage drops below **83 %** (current baseline is ~86 %, so there's modest headroom).
 
 To reproduce locally:
 
@@ -72,15 +73,15 @@ Per-file baseline at the time of writing:
 | File                              | Lines  |
 | --------------------------------- | -----: |
 | `collectors/process_bandwidth.rs` |  99 %  |
+| `platform/linux.rs`               |  97 %  |
 | `collectors/traffic.rs`           |  94 %  |
 | `collectors/connections.rs`       |  89 %  |
 | `collectors/network_intel.rs`     |  85 %  |
 | `collectors/config.rs`            |  85 %  |
 | `collectors/disk.rs`              |  84 %  |
 | `collectors/health.rs`            |  79 %  |
-| `collectors/system.rs`            |  62 %  |
-| `platform/linux.rs`               |   0 %  |
-| **Total**                         | **82 %** |
+| `collectors/system.rs`            |  79 %  |
+| **Total**                         | **86 %** |
 
 `platform/linux.rs` is at 0 % because nothing in the test suite calls `collect_interface_stats()` directly — `traffic` tests construct an `InterfaceStats` map by hand. That's by design: platform shims are exercised by the integration suite in the agent, not by SDK unit tests.
 

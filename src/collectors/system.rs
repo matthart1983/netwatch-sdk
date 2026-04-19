@@ -180,6 +180,73 @@ pub fn parse_proc_cpuinfo_model(text: &str) -> Option<String> {
         .filter(|s| !s.is_empty())
 }
 
+/// One `/proc/stat` CPU row's accumulated totals.
+///
+/// `/proc/stat` prints lines like:
+///   `cpu  123 0 45 678 9 0 0 0 0 0`
+/// where the ten fields are user/nice/system/idle/iowait/irq/softirq/steal/
+/// guest/guest_nice jiffies since boot. We only need (idle, total) to
+/// compute a utilisation percentage between two samples.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CpuSample {
+    pub idle: u64,
+    pub total: u64,
+}
+
+/// Parse the aggregate `cpu ` line (with trailing space) from `/proc/stat`.
+///
+/// Returns `None` if the first line isn't the aggregate row or if fewer
+/// than the four required fields are present. The aggregate row is
+/// always the first line on a modern kernel.
+pub fn parse_proc_stat_aggregate(text: &str) -> Option<CpuSample> {
+    let line = text.lines().next()?;
+    if !line.starts_with("cpu ") {
+        return None;
+    }
+    parse_cpu_stat_line(line)
+}
+
+/// Parse per-core `cpuN ` lines from `/proc/stat` into a `CpuSample` per core.
+///
+/// Skips the aggregate `cpu ` row. Returns an empty Vec when no per-core
+/// lines are present (shouldn't happen on Linux but keeps the function
+/// total).
+pub fn parse_proc_stat_per_core(text: &str) -> Vec<CpuSample> {
+    text.lines()
+        .filter(|l| l.starts_with("cpu") && !l.starts_with("cpu "))
+        .filter_map(parse_cpu_stat_line)
+        .collect()
+}
+
+fn parse_cpu_stat_line(line: &str) -> Option<CpuSample> {
+    let vals: Vec<u64> = line
+        .split_whitespace()
+        .skip(1) // drop the "cpu" / "cpuN" label
+        .filter_map(|v| v.parse().ok())
+        .collect();
+    if vals.len() < 4 {
+        return None;
+    }
+    Some(CpuSample {
+        idle: vals[3],
+        total: vals.iter().sum(),
+    })
+}
+
+/// Compute the CPU utilisation percentage (0–100, rounded to 0.1) between
+/// two `/proc/stat` samples. `before` must have been taken strictly before
+/// `after`; otherwise `saturating_sub` clamps the deltas to zero and we
+/// return 0 %.
+pub fn cpu_pct_from_samples(before: &CpuSample, after: &CpuSample) -> f64 {
+    let total_diff = after.total.saturating_sub(before.total);
+    if total_diff == 0 {
+        return 0.0;
+    }
+    let idle_diff = after.idle.saturating_sub(before.idle);
+    let usage = (total_diff - idle_diff) as f64 / total_diff as f64 * 100.0;
+    (usage * 10.0).round() / 10.0
+}
+
 #[cfg(target_os = "linux")]
 mod linux {
     use super::*;
@@ -237,63 +304,21 @@ mod linux {
         None
     }
 
-    struct CpuSample {
-        idle: u64,
-        total: u64,
-    }
-
     fn read_cpu_sample() -> Option<CpuSample> {
         let contents = fs::read_to_string("/proc/stat").ok()?;
-        let line = contents.lines().next()?;
-        if !line.starts_with("cpu ") {
-            return None;
-        }
-        let vals: Vec<u64> = line
-            .split_whitespace()
-            .skip(1)
-            .filter_map(|v| v.parse().ok())
-            .collect();
-        if vals.len() < 4 {
-            return None;
-        }
-        let idle = vals[3];
-        let total: u64 = vals.iter().sum();
-        Some(CpuSample { idle, total })
+        parse_proc_stat_aggregate(&contents)
     }
 
     pub fn measure_cpu_usage() -> Option<f64> {
         let s1 = read_cpu_sample()?;
         thread::sleep(Duration::from_millis(200));
         let s2 = read_cpu_sample()?;
-
-        let total_diff = s2.total.saturating_sub(s1.total);
-        let idle_diff = s2.idle.saturating_sub(s1.idle);
-        if total_diff == 0 {
-            return Some(0.0);
-        }
-
-        let usage = (total_diff - idle_diff) as f64 / total_diff as f64 * 100.0;
-        Some((usage * 10.0).round() / 10.0)
+        Some(cpu_pct_from_samples(&s1, &s2))
     }
 
     fn read_per_core_samples() -> Option<Vec<CpuSample>> {
         let contents = fs::read_to_string("/proc/stat").ok()?;
-        let mut cores = Vec::new();
-        for line in contents.lines() {
-            if line.starts_with("cpu") && !line.starts_with("cpu ") {
-                let vals: Vec<u64> = line
-                    .split_whitespace()
-                    .skip(1)
-                    .filter_map(|v| v.parse().ok())
-                    .collect();
-                if vals.len() < 4 {
-                    continue;
-                }
-                let idle = vals[3];
-                let total: u64 = vals.iter().sum();
-                cores.push(CpuSample { idle, total });
-            }
-        }
+        let cores = parse_proc_stat_per_core(&contents);
         if cores.is_empty() {
             None
         } else {
@@ -310,22 +335,12 @@ mod linux {
             return None;
         }
 
-        let usages: Vec<f64> = s1
-            .iter()
-            .zip(s2.iter())
-            .map(|(a, b)| {
-                let total_diff = b.total.saturating_sub(a.total);
-                let idle_diff = b.idle.saturating_sub(a.idle);
-                if total_diff == 0 {
-                    0.0
-                } else {
-                    let usage = (total_diff - idle_diff) as f64 / total_diff as f64 * 100.0;
-                    (usage * 10.0).round() / 10.0
-                }
-            })
-            .collect();
-
-        Some(usages)
+        Some(
+            s1.iter()
+                .zip(s2.iter())
+                .map(|(a, b)| cpu_pct_from_samples(a, b))
+                .collect(),
+        )
     }
 
     pub fn read_memory() -> Option<MemoryInfo> {
@@ -621,5 +636,127 @@ BogoMIPS        : 50.00
 Features        : fp asimd evtstrm
 ";
         assert!(parse_proc_cpuinfo_model(sample).is_none());
+    }
+
+    // ── /proc/stat ────────────────────────────────────────────────────
+
+    #[test]
+    fn proc_stat_aggregate_reads_first_cpu_row() {
+        // Fields are user nice system idle iowait irq softirq steal guest guest_nice.
+        let sample = "\
+cpu  100 10 50 1000 5 1 1 0 0 0
+cpu0 50 5 25 500 2 0 0 0 0 0
+cpu1 50 5 25 500 3 1 1 0 0 0
+";
+        let s = parse_proc_stat_aggregate(sample).unwrap();
+        assert_eq!(s.idle, 1000);
+        assert_eq!(s.total, 100 + 10 + 50 + 1000 + 5 + 1 + 1);
+    }
+
+    #[test]
+    fn proc_stat_aggregate_rejects_non_cpu_first_line() {
+        // `/proc/stat` lines must begin with the aggregate row. Kernels
+        // that prefix with `intr` or anything else should parse to None.
+        let sample = "intr 12345 0 0\ncpu 10 0 0 90 0 0 0 0 0 0\n";
+        assert!(parse_proc_stat_aggregate(sample).is_none());
+    }
+
+    #[test]
+    fn proc_stat_aggregate_handles_short_row() {
+        // Kernels earlier than 2.6.33 omit `steal`/`guest`/`guest_nice`.
+        // We need at least four fields (user/nice/system/idle).
+        let sample = "cpu  100 10 50 1000\n";
+        let s = parse_proc_stat_aggregate(sample).unwrap();
+        assert_eq!(s.idle, 1000);
+        assert_eq!(s.total, 1160);
+    }
+
+    #[test]
+    fn proc_stat_aggregate_fails_when_fields_missing() {
+        assert!(parse_proc_stat_aggregate("cpu  1 2 3\n").is_none());
+    }
+
+    #[test]
+    fn proc_stat_per_core_counts_cores_and_skips_aggregate() {
+        let sample = "\
+cpu  100 10 50 1000 5 0 0 0 0 0
+cpu0 50 5 25 500 2 0 0 0 0 0
+cpu1 50 5 25 500 3 0 0 0 0 0
+cpu2 10 1 5 100 0 0 0 0 0 0
+";
+        let per = parse_proc_stat_per_core(sample);
+        assert_eq!(per.len(), 3);
+        assert_eq!(per[0].idle, 500);
+        assert_eq!(per[1].idle, 500);
+        assert_eq!(per[2].total, 116);
+    }
+
+    #[test]
+    fn proc_stat_per_core_empty_when_no_cpu_lines() {
+        assert!(parse_proc_stat_per_core("intr 0\nctxt 0\n").is_empty());
+    }
+
+    #[test]
+    fn cpu_pct_between_samples_busy() {
+        // After-before: total +100, idle +20 → 80% busy.
+        let before = CpuSample {
+            idle: 100,
+            total: 200,
+        };
+        let after = CpuSample {
+            idle: 120,
+            total: 300,
+        };
+        assert_eq!(cpu_pct_from_samples(&before, &after), 80.0);
+    }
+
+    #[test]
+    fn cpu_pct_between_samples_idle() {
+        // total +100, idle +100 → 0%.
+        let before = CpuSample {
+            idle: 100,
+            total: 200,
+        };
+        let after = CpuSample {
+            idle: 200,
+            total: 300,
+        };
+        assert_eq!(cpu_pct_from_samples(&before, &after), 0.0);
+    }
+
+    #[test]
+    fn cpu_pct_returns_zero_when_samples_are_equal() {
+        // Identical samples → no elapsed ticks → 0% (not NaN).
+        let s = CpuSample {
+            idle: 100,
+            total: 200,
+        };
+        assert_eq!(cpu_pct_from_samples(&s, &s), 0.0);
+    }
+
+    #[test]
+    fn cpu_pct_handles_reversed_samples_without_panicking() {
+        // `saturating_sub` clamps negative deltas to zero → 0%.
+        let later = CpuSample {
+            idle: 100,
+            total: 200,
+        };
+        let earlier = CpuSample {
+            idle: 80,
+            total: 150,
+        };
+        assert_eq!(cpu_pct_from_samples(&later, &earlier), 0.0);
+    }
+
+    #[test]
+    fn cpu_pct_rounds_to_one_decimal() {
+        // Construct a fractional percentage.
+        let before = CpuSample { idle: 0, total: 0 };
+        let after = CpuSample {
+            idle: 37,
+            total: 1000,
+        };
+        // 1000 - 37 = 963 busy → 96.3%.
+        assert!((cpu_pct_from_samples(&before, &after) - 96.3).abs() < 1e-9);
     }
 }

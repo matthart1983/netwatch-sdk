@@ -43,6 +43,11 @@ netwatch-sdk-common = { path = "crates/common", version = "0.1", features = ["us
 aya = { version = "0.13", optional = true }
 aya-log = { version = "0.2", optional = true }
 
+[dev-dependencies]
+# tempfile for filesystem-seam tests (platform::linux::tests drives
+# collect_interface_stats_from against a tempdir-shaped sysfs).
+tempfile = "3"
+
 [workspace]
 members = ["crates/common"]
 # crates/ebpf-programs is intentionally NOT a workspace member: it requires

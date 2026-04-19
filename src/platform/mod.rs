@@ -17,7 +17,10 @@ pub struct InterfaceStats {
     pub is_up: bool,
 }
 
-#[cfg(target_os = "linux")]
+// The linux module is always compiled so its pure `collect_interface_stats_from`
+// helper can be exercised by the unit-test suite on any host. Only the
+// `/sys/class/net` wrapper is Linux-only at runtime, and the module gate
+// below controls which `collect_interface_stats` we re-export.
 mod linux;
 #[cfg(target_os = "linux")]
 pub use linux::collect_interface_stats;
