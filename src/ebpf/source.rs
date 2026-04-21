@@ -130,15 +130,25 @@ mod linux {
         // aya::Bpf must outlive every attached program; dropping it detaches.
         _bpf: Bpf,
         shutdown: Arc<AtomicBool>,
-        reader: Option<JoinHandle<()>>,
+        // Held only so the handle lives as long as Inner. JoinHandle's
+        // default Drop detaches the thread — we deliberately don't join
+        // (see Drop impl comment).
+        _reader: Option<JoinHandle<()>>,
     }
 
     impl Drop for Inner {
         fn drop(&mut self) {
+            // Signal shutdown and detach. We don't join the reader for
+            // two reasons:
+            //   1. On a busy host the inner ring-buffer drain can loop
+            //      between shutdown checks and hold the thread indefinitely.
+            //   2. aya::Bpf's own Drop (which runs after this, from the
+            //      auto field-drop) closes the program fd; the reader
+            //      will see its next `ring.next()` return nothing and
+            //      check the flag.
+            // The test process exits shortly after anyway; the thread
+            // is reaped with it.
             self.shutdown.store(true, Ordering::Relaxed);
-            if let Some(h) = self.reader.take() {
-                let _ = h.join();
-            }
         }
     }
 
@@ -222,8 +232,15 @@ mod linux {
                     // Always drain — `poll` returning 0 (timeout) just
                     // means no wakeup arrived; events that landed between
                     // the previous drain and the poll register are still
-                    // sitting in the ring buffer.
+                    // sitting in the ring buffer. Check the shutdown
+                    // flag inside the loop: on a busy host the ring
+                    // buffer can stay non-empty indefinitely, and
+                    // shutdown would otherwise only be observed at the
+                    // next outer-loop iteration (which never comes).
                     while let Some(item) = ring.next() {
+                        if shutdown_for_thread.load(Ordering::Relaxed) {
+                            return;
+                        }
                         let bytes = item.as_ref();
                         if bytes.is_empty() {
                             continue;
@@ -253,7 +270,7 @@ mod linux {
                 _inner: Inner {
                     _bpf: bpf,
                     shutdown,
-                    reader: Some(reader),
+                    _reader: Some(reader),
                 },
             },
             rx,
