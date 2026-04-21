@@ -129,6 +129,7 @@ jobs:
     #   3. Locate the emitted test binary, run it under sudo.
     needs: ebpf-build
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
 
@@ -194,4 +195,8 @@ jobs:
       - name: Run integration test as root
         # sudo preserves the existing PATH so ldconfig, etc. still work.
         # --nocapture so the skip messages or assertion output show up.
-        run: sudo ${{ steps.testbin.outputs.bin }} --nocapture
+        # `timeout 60` is belt-and-suspenders — if the test binary hangs
+        # (e.g. reader-thread Drop deadlock) we want to know within a
+        # minute, not after the whole job's 10-minute budget elapses.
+        timeout-minutes: 3
+        run: sudo timeout 60 ${{ steps.testbin.outputs.bin }} --nocapture
