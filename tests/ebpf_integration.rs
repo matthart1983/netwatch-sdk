@@ -14,7 +14,6 @@
 #![cfg(all(target_os = "linux", feature = "ebpf"))]
 
 use netwatch_sdk::ebpf::{EbpfError, EbpfEvent, EventSource};
-use std::io::Read;
 use std::net::{TcpListener, TcpStream};
 use std::time::{Duration, Instant};
 
@@ -43,46 +42,39 @@ fn tcp_v4_connect_kprobe_round_trip() {
 
     // Bind a TCP listener on an ephemeral loopback port. The kprobe fires
     // on the client's `tcp_v4_connect` kcall, so we just need *somewhere*
-    // to connect to.
+    // to connect to. We never call accept — the connect syscall still
+    // reaches tcp_v4_connect in the kernel before any accept races, and
+    // leaving the listener socket alone removes the previous harness's
+    // classic deadlock chain (server thread blocks on stream.read, which
+    // blocks on client close, which blocks on end-of-scope drop).
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind loopback listener");
     let port = listener.local_addr().unwrap().port();
 
-    // Accept in a helper thread so `connect` doesn't hang the test.
-    let server = std::thread::spawn(move || {
-        if let Ok((mut stream, _)) = listener.accept() {
-            let mut buf = [0u8; 1];
-            let _ = stream.read(&mut buf);
-        }
-    });
-
-    // Small delay so the kprobe attach completes before the connect fires
-    // — otherwise we race the attach and the event can land before the
-    // userspace reader is set up to observe it.
+    // Small delay so the kprobe attach completes before the connect fires.
     std::thread::sleep(Duration::from_millis(50));
 
-    let _conn = TcpStream::connect(("127.0.0.1", port)).expect("connect to listener");
+    let conn = TcpStream::connect(("127.0.0.1", port)).expect("connect to listener");
 
     // Drain events for up to 2 seconds looking for our connect.
     let deadline = Instant::now() + Duration::from_secs(2);
     let mut observed: Option<u16> = None;
     while Instant::now() < deadline {
-        match rx.recv_timeout(Duration::from_millis(100)) {
-            Ok(EbpfEvent::Connect(c)) => {
-                // The kprobe fires on every outbound connect on the host,
-                // not just ours. Match on dport to find our event.
-                if c.dport == port {
-                    observed = Some(c.dport);
-                    break;
-                }
+        if let Ok(EbpfEvent::Connect(c)) = rx.recv_timeout(Duration::from_millis(100)) {
+            // The kprobe fires on every outbound connect on the host,
+            // not just ours. Match on dport to find our event.
+            if c.dport == port {
+                observed = Some(c.dport);
+                break;
             }
-            Err(_) => continue,
         }
     }
 
-    // Tear down before asserting so a failure doesn't leave a hanging
-    // reader thread behind.
+    // Close the connection and tear down the BPF source before asserting.
+    // Ordering matters so the reader thread has nothing left to process
+    // and EventSource::Drop doesn't race with `conn`'s close.
+    drop(conn);
+    drop(listener);
     drop(source);
-    server.join().ok();
 
     assert_eq!(
         observed,
