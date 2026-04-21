@@ -55,19 +55,26 @@ fn tcp_v4_connect_kprobe_round_trip() {
 
     let conn = TcpStream::connect(("127.0.0.1", port)).expect("connect to listener");
 
-    // Drain events for up to 2 seconds looking for our connect.
+    // Drain events for up to 2 seconds looking for our connect. Record
+    // every event we see so a miss produces a diagnostic log rather than
+    // just "no event matched".
     let deadline = Instant::now() + Duration::from_secs(2);
     let mut observed: Option<u16> = None;
+    let mut all_events: Vec<u16> = Vec::new();
     while Instant::now() < deadline {
         if let Ok(EbpfEvent::Connect(c)) = rx.recv_timeout(Duration::from_millis(100)) {
-            // The kprobe fires on every outbound connect on the host,
-            // not just ours. Match on dport to find our event.
+            all_events.push(c.dport);
             if c.dport == port {
                 observed = Some(c.dport);
                 break;
             }
         }
     }
+    eprintln!(
+        "diagnostic: looking for dport={port}, saw {} connect events total: {:?}",
+        all_events.len(),
+        all_events
+    );
 
     // Close the connection and tear down the BPF source before asserting.
     // Ordering matters so the reader thread has nothing left to process
