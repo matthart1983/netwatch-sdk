@@ -11,12 +11,6 @@ description = "BPF programs loaded by the netwatch-sdk eBPF event source. Built 
 [package.metadata]
 build-cmd = "scripts/build-ebpf.sh"
 
-[lib]
-# We compile to a static `.a` and link the produced object via the linker
-# script that aya-ebpf-macros expects. `crate-type = ["lib"]` is the
-# default, but we make it explicit for clarity.
-path = "src/main.rs"
-
 [[bin]]
 name = "netwatch_sdk_ebpf"
 path = "src/main.rs"

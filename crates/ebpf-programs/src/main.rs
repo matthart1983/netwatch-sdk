@@ -24,6 +24,15 @@ use aya_ebpf::{
 };
 use netwatch_sdk_common::{ConnectV4Event, EventKind, COMM_LEN};
 
+/// BPF programs that call GPL-only kernel helpers (bpf_probe_read_kernel,
+/// bpf_ktime_get_ns, etc.) must declare a GPL-compatible license. The
+/// kernel reads this from the `license` ELF section at program load; aya
+/// also checks for it before attach. Missing it causes the load to fail
+/// with a misleading "Invalid ELF header" error.
+#[no_mangle]
+#[link_section = "license"]
+pub static LICENSE: [u8; 4] = *b"GPL\0";
+
 /// 256 KiB ring buffer. Sized to absorb burst rates of ~5k connect/sec
 /// without dropping if userspace stalls for a few hundred ms. Tunable
 /// once we have real workload data.
