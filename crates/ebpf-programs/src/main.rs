@@ -53,59 +53,47 @@ pub fn tcp_v4_connect(ctx: ProbeContext) -> u32 {
 }
 
 fn try_tcp_v4_connect(ctx: ProbeContext) -> Result<(), i64> {
-    // Reserve space in the ring buffer for one event.
-    let mut entry = EVENTS.reserve::<ConnectV4Event>(0).ok_or(0i64)?;
+    use aya_ebpf::helpers::bpf_probe_read_kernel;
+
+    // Pull every field we need BEFORE reserving the ring-buffer entry.
+    // Reserving creates a resource the BPF verifier insists we release
+    // on every exit path (`submit` or `discard`). If we reserve up front
+    // and then bail on a read failure, the verifier rejects the program
+    // with "Unreleased reference … BPF_EXIT would lead to reference leak".
+    let sk: *const u8 = ctx.arg(0).ok_or(1i64)?;
 
     let pid_tgid = bpf_get_current_pid_tgid();
     let tgid = (pid_tgid >> 32) as u32;
     let pid = pid_tgid as u32;
-
     let comm = bpf_get_current_comm().unwrap_or([0u8; COMM_LEN]);
     let timestamp_ns = unsafe { bpf_ktime_get_ns() };
 
-    // Pull the `struct sock *` first arg.
+    // struct sock_common (__sk_common) layout on a 5.15 reference kernel:
+    //   skc_daddr      @ 0x00 (u32, network byte order)
+    //   skc_rcv_saddr  @ 0x04 (u32, network byte order)
+    //   skc_dport      @ 0x0C (u16, network byte order)
+    //   skc_num        @ 0x0E (u16, host byte order — not what we want)
     //
-    // Layout-wise, what we want is on the kernel struct `inet_sock`:
-    //   - inet->inet_saddr  (network byte order u32)
-    //   - inet->inet_daddr  (network byte order u32, populated from uaddr
-    //     before tcp_v4_connect proper, depending on kernel version)
-    //   - inet->inet_sport  (network byte order u16)
-    //   - inet->inet_dport  (network byte order u16)
+    // These offsets will move to aya's CO-RE `bpf_core_read!` in a later
+    // iteration; for the first landed kprobe we accept the kernel-version
+    // sensitivity. sport lives on inet_sock, not sock_common, and needs
+    // CO-RE to read cleanly — Phase 1 reports it as 0.
     //
-    // For simplicity in this first program we read what we know is
-    // available from `struct sock` (sk_rcv_saddr / sk_daddr / sk_num /
-    // sk_dport via the embedded `__sk_common`). The destination address
-    // and port are populated by the caller before tcp_v4_connect is
-    // invoked, so we can read them here.
-    let sk: *const u8 = ctx.arg(0).ok_or(1i64)?;
-
-    // Offsets into struct sock.__sk_common on a CO-RE-tracked 5.10+ kernel.
-    // These are obtained from BTF when CO-RE relocations land; for the
-    // initial implementation we rely on the BTF-based bpf_core_read which
-    // aya provides. To keep this file simple we use raw offsets that match
-    // a 5.15 reference kernel layout — they will be replaced with CO-RE
-    // reads in the next iteration.
-    //
-    // SAFETY: aya-ebpf wraps these in bpf_probe_read_kernel under the
-    // hood. The offsets are kernel-version-sensitive (TODO: switch to
-    // CO-RE).
-    use aya_ebpf::helpers::bpf_probe_read_kernel;
-
-    // struct sock_common __sk_common layout (kernel 5.15):
-    //   skc_daddr        @ 0x00 (u32, BE)
-    //   skc_rcv_saddr    @ 0x04 (u32, BE)
-    //   skc_dport        @ 0x0C (u16, BE)
-    //   skc_num          @ 0x0E (u16, host order — NOT what we want for sport)
-    //
-    // For the source port in network byte order we read inet_sock->inet_sport
-    // which sits at a different offset. As a placeholder until CO-RE lands,
-    // we report sport = 0 and document the limitation.
-    let daddr = unsafe { bpf_probe_read_kernel::<u32>(sk as *const u32).unwrap_or(0) };
+    // SAFETY: aya-ebpf wraps these as bpf_probe_read_kernel calls.
+    let daddr =
+        unsafe { bpf_probe_read_kernel::<u32>(sk as *const u32).unwrap_or(0) };
     let saddr =
         unsafe { bpf_probe_read_kernel::<u32>(sk.add(4) as *const u32).unwrap_or(0) };
     let dport =
         unsafe { bpf_probe_read_kernel::<u16>(sk.add(0x0C) as *const u16).unwrap_or(0) };
-    let sport: u16 = 0; // TODO: CO-RE-relocated read of inet_sport
+    let sport: u16 = 0;
+
+    // Now reserve. After this point there are no early returns: we either
+    // submit or discard on every path, satisfying the verifier's
+    // reference-accounting rules.
+    let Some(mut entry) = EVENTS.reserve::<ConnectV4Event>(0) else {
+        return Err(0);
+    };
 
     let event = ConnectV4Event {
         kind: EventKind::TcpV4Connect,
@@ -120,9 +108,8 @@ fn try_tcp_v4_connect(ctx: ProbeContext) -> Result<(), i64> {
         timestamp_ns,
     };
 
-    // Commit the entry into the ring buffer. The 0 flag means "wake up
-    // userspace if poll'd"; pass BPF_RB_NO_WAKEUP to trade latency for
-    // throughput once we know the consumer pattern.
+    // Commit. 0 flag = "wake up userspace if poll'd"; BPF_RB_NO_WAKEUP
+    // would trade latency for throughput once we know the consumer pattern.
     entry.write(event);
     entry.submit(0);
 
