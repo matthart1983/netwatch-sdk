@@ -154,8 +154,17 @@ jobs:
           ls -la target/bpf/
           file target/bpf/netwatch_sdk_ebpf.o
           sha256sum target/bpf/netwatch_sdk_ebpf.o
-          head -c 16 target/bpf/netwatch_sdk_ebpf.o | xxd
+          head -c 64 target/bpf/netwatch_sdk_ebpf.o | xxd
           echo "size=$(stat -c%s target/bpf/netwatch_sdk_ebpf.o) bytes"
+          echo
+          echo "=== readelf -h ==="
+          readelf -h target/bpf/netwatch_sdk_ebpf.o
+          echo "=== readelf -SW ==="
+          readelf -SW target/bpf/netwatch_sdk_ebpf.o
+          echo "=== bpf-linker version ==="
+          bpf-linker --version || true
+          echo "=== aya crate version ==="
+          grep '^name = "aya"' -A 1 Cargo.lock | head -4
 
       - name: Build integration test binary (unprivileged)
         run: cargo test --features ebpf --test ebpf_integration --no-run
