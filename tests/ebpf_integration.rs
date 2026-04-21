@@ -65,13 +65,16 @@ fn tcp_v4_connect_kprobe_round_trip() {
     // CO-RE follow-up lands (see docs/plans/ebpf.md).
     let our_pid = std::process::id();
     let deadline = Instant::now() + Duration::from_secs(2);
-    let mut observed_pid = false;
-    let mut event_count = 0;
+    let mut observed = false;
+    let mut seen: Vec<(u32, u32, String)> = Vec::new();
     while Instant::now() < deadline {
         if let Ok(EbpfEvent::Connect(c)) = rx.recv_timeout(Duration::from_millis(100)) {
-            event_count += 1;
-            if c.pid == our_pid {
-                observed_pid = true;
+            seen.push((c.pid, c.tgid, c.comm.clone()));
+            // Match on either pid or tgid — BPF's pid_tgid split is
+            // (tgid << 32) | pid, and the userspace side reports them
+            // symmetrically. std::process::id() returns the tgid.
+            if c.pid == our_pid || c.tgid == our_pid {
+                observed = true;
                 eprintln!(
                     "observed our connect: pid={} tgid={} comm={:?} dport={} (dport may be 0 pre-CO-RE)",
                     c.pid, c.tgid, c.comm, c.dport
@@ -80,9 +83,11 @@ fn tcp_v4_connect_kprobe_round_trip() {
             }
         }
     }
-    eprintln!(
-        "diagnostic: saw {event_count} connect events total in 2s window",
-    );
+    eprintln!("diagnostic: looking for pid/tgid={our_pid}");
+    eprintln!("diagnostic: saw {} connect events total:", seen.len());
+    for (pid, tgid, comm) in &seen {
+        eprintln!("  pid={pid} tgid={tgid} comm={comm:?}");
+    }
 
     // Close the connection and tear down the BPF source before asserting.
     // Ordering matters so the reader thread has nothing left to process
@@ -92,7 +97,7 @@ fn tcp_v4_connect_kprobe_round_trip() {
     drop(source);
 
     assert!(
-        observed_pid,
-        "no Connect event observed for our pid ({our_pid}) within 2s"
+        observed,
+        "no Connect event observed for our pid/tgid ({our_pid}) within 2s"
     );
 }
