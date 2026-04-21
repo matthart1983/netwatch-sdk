@@ -137,9 +137,11 @@ jobs:
         with:
           toolchain: nightly-2026-01-15
           components: rust-src,rustc-dev,llvm-tools-preview
-      - uses: Swatinem/rust-cache@v2
-        with:
-          shared-key: ebpf-integration
+      # No rust-cache here — the build.rs staging of target/bpf/…
+      # into OUT_DIR doesn't play well with cache restoration, which
+      # can resurrect a stale (empty or malformed) embedded BPF object.
+      # The BPF build is cheap; the clean build is worth the
+      # determinism.
 
       - name: Install bpf-linker
         run: cargo install bpf-linker --locked
@@ -147,8 +149,28 @@ jobs:
       - name: Build BPF programs
         run: scripts/build-ebpf.sh
 
+      - name: Inspect the staged BPF object
+        run: |
+          ls -la target/bpf/
+          file target/bpf/netwatch_sdk_ebpf.o
+          sha256sum target/bpf/netwatch_sdk_ebpf.o
+          head -c 16 target/bpf/netwatch_sdk_ebpf.o | xxd
+          echo "size=$(stat -c%s target/bpf/netwatch_sdk_ebpf.o) bytes"
+
       - name: Build integration test binary (unprivileged)
         run: cargo test --features ebpf --test ebpf_integration --no-run
+
+      - name: Inspect what build.rs embedded into OUT_DIR
+        run: |
+          embedded=$(find target -name netwatch_sdk_ebpf.o -path '*/build/*/out/*' | head -1)
+          if [ -n "$embedded" ]; then
+            ls -la "$embedded"
+            sha256sum "$embedded"
+            head -c 16 "$embedded" | xxd
+          else
+            echo "!! no embedded BPF object found in build/out/"
+            find target -name netwatch_sdk_ebpf.o -ls
+          fi
 
       - name: Locate the test binary
         id: testbin

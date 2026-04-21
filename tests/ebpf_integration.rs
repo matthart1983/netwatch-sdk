@@ -29,12 +29,15 @@ fn tcp_v4_connect_kprobe_round_trip() {
             );
             return;
         }
-        Err(e) => {
-            eprintln!(
-                "EventSource::new failed ({e}); likely missing CAP_BPF. \
-                 Run under sudo. Skipping."
-            );
+        Err(EbpfError::UnsupportedPlatform) => {
+            eprintln!("eBPF is Linux-only; skipping on this platform.");
             return;
+        }
+        Err(e) => {
+            // This path fires on genuine kernel-side failures: verifier
+            // rejection, missing CAP_BPF, malformed BPF object. Fail hard
+            // with the reason so CI logs capture the real cause.
+            panic!("EventSource::new failed: {e:?}");
         }
     };
 
