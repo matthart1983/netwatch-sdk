@@ -147,7 +147,13 @@ mod linux {
             return Err(EbpfError::BpfObjectMissing);
         }
 
-        let mut bpf = Bpf::load(BPF_OBJECT).map_err(|e| EbpfError::LoadFailed(format!("{e:?}")))?;
+        // `include_bytes!` returns bytes with 1-byte alignment. aya's ELF
+        // parser (the `object` crate) reads `FileHeader64` at offset 0,
+        // which needs 8-byte alignment. Copy into a Vec so the allocator
+        // hands us properly aligned memory.
+        let object: Vec<u8> = BPF_OBJECT.to_vec();
+        let mut bpf =
+            Bpf::load(&object).map_err(|e| EbpfError::LoadFailed(format!("{e:?}")))?;
 
         // Attach kprobe.
         let program: &mut KProbe = bpf
