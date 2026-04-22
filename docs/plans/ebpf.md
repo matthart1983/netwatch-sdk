@@ -1,6 +1,6 @@
 # Plan — Full eBPF support
 
-> Status: **Phase 1 scaffolding shipped**; real BPF compilation pending a Linux session.
+> Status: **Phase 1 kernel-validated.** End-to-end round-trip works on GitHub-hosted ubuntu-latest runners: kprobe compiles, attaches, fires on userspace `connect()`, event reaches userspace via the ring buffer. CI `ebpf-integration` job gates every push against this. Remaining Phase 1 polish: CO-RE wiring so struct-sock field reads work across kernel versions.
 > Owner: TBD.
 > Scope: SDK only. Cloud and dashboard changes are tracked separately.
 
@@ -39,10 +39,12 @@
 | CI builds the BPF object on every push                       | ✅ shipped (`ebpf-build` job) |
 | `--features ebpf` builds + tests on Linux + macOS            | ✅ shipped           |
 | Reader thread: `poll(2)`-based wakeup with shutdown flag     | ✅ shipped           |
+| **Kernel-attach integration test — end-to-end verified**     | ✅ shipped (`ebpf-integration` job) |
 | CO-RE relocations for portable struct reads                  | ⏳ **deferred**      |
-| Privileged-container kernel-attach integration test          | ⏳ **deferred**      |
 
-CI proves the kprobe compiles to a valid eBPF ELF object (`file` reports `ELF 64-bit LSB relocatable, eBPF, version 1 (SYSV)`); the verifier hasn't actually loaded it in a kernel yet — that's what the deferred integration test will do.
+The `ebpf-integration` CI job builds the BPF object on a GitHub-hosted ubuntu-latest runner, loads it under `sudo`, attaches the kprobe to `tcp_v4_connect`, opens a loopback TCP connection, and asserts a `Connect` event arrives on the channel within 2 s with a matching PID/TGID. Typical end-to-end runtime: ~0.3 s.
+
+Known limitation it surfaces: the struct-sock field reads (`daddr`, `dport`, `saddr`) use hard-coded offsets for a 5.15 reference kernel and read as 0 on the runner's 6.x kernel. The CO-RE follow-up below fixes this.
 
 ## Deferred items — what they need
 
@@ -61,13 +63,15 @@ CI proves the kprobe compiles to a valid eBPF ELF object (`file` reports `ELF 64
 
 ### Privileged-container integration test
 
-**Why deferred:** GitHub-hosted runners can't easily expose `CAP_BPF` + `CAP_PERFMON` to a container without `--privileged`, and the inner program also needs a writable `bpffs`. Standing it up is a ~half-day of CI plumbing.
+~~Deferred~~ **Shipped.** Turned out GitHub-hosted `ubuntu-latest` already lets `sudo` load BPF programs — no Docker privilege gymnastics required. The `ebpf-integration` CI job in `.github/workflows/ci.yml` does exactly that and is green.
 
-**Next-session steps:**
+Bugs the job caught end-to-end, each a real issue that fixtures could never catch:
 
-1. Add a `ebpf-integration` job that runs the SDK tests inside `docker run --privileged --pid=host -v $PWD:/work ubuntu:24.04 bash -c '…'`.
-2. Inside the container: install `clang` + `libelf` + `bpftool`, set up `/sys/kernel/btf` mount, run a small Rust integration test that calls `EventSource::new()`, opens a TCP socket to `127.0.0.1:1`, and asserts a `Connect` event arrives within 1 second.
-3. Add `--cap-add BPF --cap-add PERFMON` + a `securityContext.privileged: true` workaround if `--privileged` is too broad.
+1. `include_bytes!` returns 1-byte-aligned bytes; aya's ELF parser needs 8-byte alignment. Fixed by copying the embedded object to a `Vec<u8>` before `Bpf::load`.
+2. BPF verifier rejected the program with "Unreleased reference id=2 alloc_insn=5" — `EVENTS.reserve()` happened before fallible reads, so an early return leaked the reservation. Restructured to reserve after all reads succeed.
+3. Missing `license = "GPL\0"` section. Kernel helpers that touch raw memory require a GPL-compatible license.
+4. Reader thread's Drop-join could deadlock on busy hosts where the ring buffer stays non-empty between shutdown checks. Switched to detach-on-drop + mid-drain shutdown check.
+5. Test harness had a circular wait (server thread blocked on `stream.read`, main thread blocked on `server.join`). Removed the server — TCP `connect` still hits `tcp_v4_connect` without an accept.
 
 ## Original phase plan
 
