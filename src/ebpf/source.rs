@@ -206,7 +206,7 @@ mod linux {
         let reader = thread::Builder::new()
             .name("netwatch-sdk-ebpf-reader".into())
             .spawn(move || {
-                use netwatch_sdk_common::{ConnectV4Event, EventKind};
+                use crate::wire::{ConnectV4Event, EventKind};
                 let mut pollfd = libc::pollfd {
                     fd: ring_fd,
                     events: libc::POLLIN,

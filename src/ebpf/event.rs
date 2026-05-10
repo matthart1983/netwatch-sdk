@@ -10,6 +10,9 @@
 //!    to think about endianness.
 //! 2. **`comm` is a `String`.** The kernel writes a 16-byte NUL-padded
 //!    array; userspace trims and validates UTF-8 once.
+//!
+//! The on-the-wire types live in `crate::wire` (see that module for the
+//! contract that the BPF-side copy in `crates/ebpf-programs` mirrors).
 
 use chrono::{DateTime, TimeZone, Utc};
 
@@ -51,14 +54,14 @@ pub struct ConnectEvent {
 }
 
 impl ConnectEvent {
-    /// Decode a `netwatch_sdk_common::ConnectV4Event` from the BPF ring
-    /// buffer into the public, host-byte-order representation.
+    /// Decode a `crate::wire::ConnectV4Event` from the BPF ring buffer
+    /// into the public, host-byte-order representation.
     ///
     /// `boot_time` is the wall-clock instant when the kernel booted; we
     /// add the per-event `bpf_ktime_get_ns` to it to produce a usable
     /// timestamp.
     pub(crate) fn decode(
-        raw: &netwatch_sdk_common::ConnectV4Event,
+        raw: &crate::wire::ConnectV4Event,
         boot_time: DateTime<Utc>,
     ) -> Self {
         let comm_end = raw
@@ -123,7 +126,7 @@ pub(crate) fn estimate_boot_time() -> DateTime<Utc> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use netwatch_sdk_common::{ConnectV4Event, EventKind, COMM_LEN};
+    use crate::wire::{ConnectV4Event, EventKind, COMM_LEN};
 
     #[test]
     fn decode_converts_addresses_and_ports_to_host_order() {

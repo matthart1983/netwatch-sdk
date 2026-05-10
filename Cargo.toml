@@ -1,6 +1,6 @@
 [package]
 name = "netwatch-sdk"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2021"
 description = "Shared wire-format types and collectors for NetWatch Cloud — the SDK consumed by netwatch-agent and the NetWatch Cloud server. Parses /proc, ss, lsof, nettop, and libpcap events into a common Snapshot payload."
 license = "MIT"
@@ -24,7 +24,7 @@ default = []
 # of `EventSource` lives behind `#[cfg(target_os = "linux")]` and returns
 # `EbpfError::UnsupportedPlatform` so cross-platform binaries still build
 # with the feature enabled.
-ebpf = ["dep:netwatch-sdk-common", "dep:aya", "dep:aya-log"]
+ebpf = ["dep:aya", "dep:aya-log"]
 
 [dependencies]
 serde = { version = "1", features = ["derive"] }
@@ -32,9 +32,6 @@ anyhow = "1"
 chrono = { version = "0.4", features = ["serde"] }
 uuid = { version = "1", features = ["v4", "serde"] }
 libc = "0.2"
-
-# Cross-platform optional deps for the `ebpf` feature.
-netwatch-sdk-common = { path = "crates/common", version = "0.1", features = ["user"], optional = true }
 
 # Linux-only optional deps for the `ebpf` feature. Cargo silently skips
 # these when the target doesn't match, so `--features ebpf` builds clean
