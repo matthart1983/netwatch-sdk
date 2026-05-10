@@ -1,7 +1,15 @@
-# aya BPF programs need nightly for the bpfel-unknown-none target and
-# build-std support. Pin a known-good nightly so CI is reproducible.
-# Bump intentionally and verify locally before pushing.
+# aya BPF programs need nightly for `-Z build-std` (configured in
+# .cargo/config.toml) plus the rust-src component to build core from
+# source. Pin a known-good nightly so CI is reproducible — bump
+# intentionally and verify locally before pushing.
+#
+# DO NOT add `targets = ["bpfel-unknown-none"]` here. That target is
+# tier 3 and has no rustup-installable rust-std on any nightly; listing
+# it makes rustup error with "component 'rust-std' for target
+# 'bpfel-unknown-none' is unavailable for download" when scripts/
+# build-ebpf.sh enters this directory and rustup honors the file. The
+# `target` field in `.cargo/config.toml` is what tells cargo to *build*
+# for bpfel-unknown-none; build-std fills the std side from source.
 [toolchain]
 channel = "nightly-2026-01-15"
 components = ["rust-src", "rustc-dev", "llvm-tools-preview"]
-targets = ["bpfel-unknown-none"]
