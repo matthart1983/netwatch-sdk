@@ -1,6 +1,6 @@
 [package]
 name = "netwatch-sdk"
-version = "0.1.1"
+version = "0.1.2"
 edition = "2021"
 description = "Shared wire-format types and collectors for NetWatch Cloud — the SDK consumed by netwatch-agent and the NetWatch Cloud server. Parses /proc, ss, lsof, nettop, and libpcap events into a common Snapshot payload."
 license = "MIT"
