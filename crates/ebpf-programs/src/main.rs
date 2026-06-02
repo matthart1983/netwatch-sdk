@@ -60,7 +60,17 @@ fn try_tcp_v4_connect(ctx: ProbeContext) -> Result<(), i64> {
     // on every exit path (`submit` or `discard`). If we reserve up front
     // and then bail on a read failure, the verifier rejects the program
     // with "Unreleased reference … BPF_EXIT would lead to reference leak".
-    let sk: *const u8 = ctx.arg(0).ok_or(1i64)?;
+    // `uaddr` (arg 1) is the destination `struct sockaddr_in *`. The syscall
+    // layer copies the user-supplied address into kernel memory before
+    // tcp_v4_connect runs, so bpf_probe_read_kernel is correct here.
+    //
+    // Crucially the destination is valid at function ENTRY. The socket's own
+    // sock_common fields (skc_daddr @0x00, skc_rcv_saddr @0x04, skc_dport
+    // @0x0C) are NOT — the kernel only populates them later inside
+    // tcp_v4_connect. The previous version read them at entry and got all
+    // zeros, so every event was discarded downstream and eBPF attribution
+    // never worked (issue #38). Read the destination from uaddr instead.
+    let uaddr: *const u8 = ctx.arg(1).ok_or(1i64)?;
 
     let pid_tgid = bpf_get_current_pid_tgid();
     let tgid = (pid_tgid >> 32) as u32;
@@ -68,24 +78,18 @@ fn try_tcp_v4_connect(ctx: ProbeContext) -> Result<(), i64> {
     let comm = bpf_get_current_comm().unwrap_or([0u8; COMM_LEN]);
     let timestamp_ns = unsafe { bpf_ktime_get_ns() };
 
-    // struct sock_common (__sk_common) layout on a 5.15 reference kernel:
-    //   skc_daddr      @ 0x00 (u32, network byte order)
-    //   skc_rcv_saddr  @ 0x04 (u32, network byte order)
-    //   skc_dport      @ 0x0C (u16, network byte order)
-    //   skc_num        @ 0x0E (u16, host byte order — not what we want)
-    //
-    // These offsets will move to aya's CO-RE `bpf_core_read!` in a later
-    // iteration; for the first landed kprobe we accept the kernel-version
-    // sensitivity. sport lives on inet_sock, not sock_common, and needs
-    // CO-RE to read cleanly — Phase 1 reports it as 0.
+    // struct sockaddr_in { sin_family @0x00 (u16); sin_port @0x02 (u16, net
+    // order); sin_addr @0x04 (u32, net order); ... }. Addresses stay in
+    // network byte order — userspace converts on decode. The source address
+    // isn't assigned until routing later in connect(), so it's reported as 0
+    // and userspace keys attribution on (daddr, dport).
     //
     // SAFETY: aya-ebpf wraps these as bpf_probe_read_kernel calls.
-    let daddr =
-        unsafe { bpf_probe_read_kernel::<u32>(sk as *const u32).unwrap_or(0) };
-    let saddr =
-        unsafe { bpf_probe_read_kernel::<u32>(sk.add(4) as *const u32).unwrap_or(0) };
     let dport =
-        unsafe { bpf_probe_read_kernel::<u16>(sk.add(0x0C) as *const u16).unwrap_or(0) };
+        unsafe { bpf_probe_read_kernel::<u16>(uaddr.add(0x02) as *const u16).unwrap_or(0) };
+    let daddr =
+        unsafe { bpf_probe_read_kernel::<u32>(uaddr.add(0x04) as *const u32).unwrap_or(0) };
+    let saddr: u32 = 0;
     let sport: u16 = 0;
 
     // Now reserve. After this point there are no early returns: we either
