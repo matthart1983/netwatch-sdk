@@ -129,6 +129,14 @@ pub struct ConnectionDetail {
     /// Kernel-measured smoothed RTT in microseconds (from eBPF tcp_probe on Linux).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub kernel_rtt_us: Option<f64>,
+    /// Cumulative bytes received on this socket since it opened (`bytes_received`
+    /// from `ss -i`). Internal — used by ProcessBandwidthTracker to rate traffic
+    /// by delta; not serialized into the snapshot.
+    #[serde(skip)]
+    pub rx_bytes: Option<u64>,
+    /// Cumulative bytes sent on this socket since it opened (`bytes_sent`).
+    #[serde(skip)]
+    pub tx_bytes: Option<u64>,
 }
 
 /// Collect the full list of connections with process attribution.
@@ -241,9 +249,15 @@ pub(crate) fn parse_ss_output(text: &str) -> Vec<ConnectionDetail> {
         // Continuation lines (kernel TCP info from `-i`) start with
         // whitespace and contain tokens like `rtt:X.X/Y.Y`.
         if line.starts_with(|c: char| c.is_whitespace()) {
-            if let Some(rtt_us) = parse_ss_rtt_us(line) {
-                if let Some(last) = connections.last_mut() {
+            if let Some(last) = connections.last_mut() {
+                if let Some(rtt_us) = parse_ss_rtt_us(line) {
                     last.kernel_rtt_us = Some(rtt_us);
+                }
+                if let Some(b) = parse_ss_u64(line, "bytes_received:") {
+                    last.rx_bytes = Some(b);
+                }
+                if let Some(b) = parse_ss_u64(line, "bytes_sent:") {
+                    last.tx_bytes = Some(b);
                 }
             }
             continue;
@@ -276,10 +290,24 @@ pub(crate) fn parse_ss_output(text: &str) -> Vec<ConnectionDetail> {
             pid,
             process_name,
             kernel_rtt_us: None,
+            rx_bytes: None,
+            tx_bytes: None,
         });
     }
 
     connections
+}
+
+/// Extract a `prefix:N` unsigned-integer token (e.g. `bytes_sent:12345`) from an
+/// `ss -i` continuation line. Returns None if absent or unparseable.
+#[allow(dead_code)]
+fn parse_ss_u64(line: &str, prefix: &str) -> Option<u64> {
+    for token in line.split_whitespace() {
+        if let Some(rest) = token.strip_prefix(prefix) {
+            return rest.parse().ok();
+        }
+    }
+    None
 }
 
 /// Extract `rtt:X.Y` (milliseconds) from an `ss -i` continuation line and
@@ -357,6 +385,8 @@ pub(crate) fn parse_lsof_output(text: &str) -> Vec<ConnectionDetail> {
                 pid,
                 process_name: process_name.clone(),
                 kernel_rtt_us: None,
+                rx_bytes: None,
+                tx_bytes: None,
             });
             *has_network = false;
         }
@@ -471,6 +501,8 @@ mod tests {
                 pid: None,
                 process_name: None,
                 kernel_rtt_us: None,
+                rx_bytes: None,
+                tx_bytes: None,
             },
             ConnectionDetail {
                 protocol: "TCP".into(),
@@ -480,6 +512,8 @@ mod tests {
                 pid: None,
                 process_name: None,
                 kernel_rtt_us: None,
+                rx_bytes: None,
+                tx_bytes: None,
             },
         ];
         let ranked = top_connections(input, 10);
@@ -594,6 +628,8 @@ tcp6 fe80::1%utun4.1024<->fe80::2%utun4.1024  utun4  Established  0 0 0 0 0  12.
                 pid: None,
                 process_name: None,
                 kernel_rtt_us: None,
+                rx_bytes: None,
+                tx_bytes: None,
             })
             .collect();
         assert_eq!(top_connections(conns, 10).len(), 10);
@@ -842,6 +878,8 @@ tcp4 10.0.0.1:1<->10.0.0.2:2 en0 Established 100 100 0 0 0 12.5 ms 45.0 ms 0 0
                     pid: None,
                     process_name: None,
                     kernel_rtt_us: None,
+                    rx_bytes: None,
+                    tx_bytes: None,
                 });
             }
             for i in 0..other_count {
@@ -853,6 +891,8 @@ tcp4 10.0.0.1:1<->10.0.0.2:2 en0 Established 100 100 0 0 0 12.5 ms 45.0 ms 0 0
                     pid: None,
                     process_name: None,
                     kernel_rtt_us: None,
+                    rx_bytes: None,
+                    tx_bytes: None,
                 });
             }
             let total = established_count + other_count;
