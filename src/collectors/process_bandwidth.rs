@@ -1,3 +1,4 @@
+use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::time::Instant;
@@ -14,6 +15,62 @@ pub struct ProcessBandwidth {
     pub rx_rate: f64,
     pub tx_rate: f64,
     pub connection_count: u32,
+    // Process detail (schema v1 additive, netwatch-sdk 0.3+). All optional so
+    // agents that omit them and backends that drop unknown fields interoperate
+    // in both directions. `process_name`/`cmd` carry the comm/exe path only —
+    // never argv, which can leak secrets off-host.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ppid: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub user: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cpu_pct: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mem_rss_bytes: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mem_virt_bytes: Option<u64>,
+    /// Single-char scheduler state: R / S / I / Z / T…
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub state: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub started_at: Option<DateTime<Utc>>,
+    /// Executable path (macOS `ps comm`, Linux `/proc/<pid>/exe`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cmd: Option<String>,
+}
+
+impl ProcessBandwidth {
+    /// A row with only the network-accounting fields set — what the in-crate
+    /// attribution helpers produce. Process-detail fields default to `None`;
+    /// callers with a metadata source fill them in afterwards.
+    #[allow(clippy::too_many_arguments)]
+    pub fn network_only(
+        process_name: String,
+        pid: Option<u32>,
+        rx_bytes: u64,
+        tx_bytes: u64,
+        rx_rate: f64,
+        tx_rate: f64,
+        connection_count: u32,
+    ) -> Self {
+        Self {
+            process_name,
+            pid,
+            rx_bytes,
+            tx_bytes,
+            rx_rate,
+            tx_rate,
+            connection_count,
+            ppid: None,
+            user: None,
+            cpu_pct: None,
+            mem_rss_bytes: None,
+            mem_virt_bytes: None,
+            state: None,
+            started_at: None,
+            cmd: None,
+        }
+    }
 }
 
 /// Attribute interface-level bandwidth to processes proportionally by the
@@ -56,15 +113,15 @@ pub fn attribute(
         .into_iter()
         .map(|((process_name, pid), count)| {
             let fraction = count as f64 / total_established as f64;
-            ProcessBandwidth {
+            ProcessBandwidth::network_only(
                 process_name,
                 pid,
-                rx_bytes: (total_rx_bytes as f64 * fraction) as u64,
-                tx_bytes: (total_tx_bytes as f64 * fraction) as u64,
-                rx_rate: total_rx_rate * fraction,
-                tx_rate: total_tx_rate * fraction,
-                connection_count: count,
-            }
+                (total_rx_bytes as f64 * fraction) as u64,
+                (total_tx_bytes as f64 * fraction) as u64,
+                total_rx_rate * fraction,
+                total_tx_rate * fraction,
+                count,
+            )
         })
         .collect();
 
@@ -171,14 +228,16 @@ impl ProcessBandwidthTracker {
 
         let mut ranked: Vec<ProcessBandwidth> = per_proc
             .into_iter()
-            .map(|((process_name, _), a)| ProcessBandwidth {
-                process_name,
-                pid: a.pid,
-                rx_bytes: a.rx_bytes,
-                tx_bytes: a.tx_bytes,
-                rx_rate: a.rx_rate,
-                tx_rate: a.tx_rate,
-                connection_count: a.conns,
+            .map(|((process_name, _), a)| {
+                ProcessBandwidth::network_only(
+                    process_name,
+                    a.pid,
+                    a.rx_bytes,
+                    a.tx_bytes,
+                    a.rx_rate,
+                    a.tx_rate,
+                    a.conns,
+                )
             })
             .collect();
 
