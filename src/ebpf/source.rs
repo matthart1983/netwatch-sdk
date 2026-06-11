@@ -2,8 +2,15 @@
 //!
 //! The Linux implementation lives behind `#[cfg(target_os = "linux")]` and
 //! is fully fleshed out: it loads the embedded BPF object, attaches the
-//! `tcp_v4_connect` kprobe, spawns a reader thread on the ring buffer,
-//! and pushes decoded `EbpfEvent`s onto a `std::sync::mpsc::Receiver`.
+//! `tcp_v4_connect` and `tcp_v6_connect` kprobes, spawns a reader thread
+//! on the ring buffer, and pushes decoded `EbpfEvent`s onto a
+//! `std::sync::mpsc::Receiver`.
+//!
+//! `tcp_v4_connect` is mandatory — failing to attach it fails `new()`.
+//! `tcp_v6_connect` (Phase 2) is best-effort: it's skipped when the
+//! embedded BPF object predates Phase 2 (a stale `pre-built/` artifact)
+//! or when the kernel has no IPv6 support, and the source degrades to
+//! v4-only attribution rather than failing outright.
 //!
 //! On non-Linux targets the same struct exists but `new()` returns
 //! `Err(EbpfError::UnsupportedPlatform)`. This keeps cross-platform crates
@@ -152,6 +159,27 @@ mod linux {
         }
     }
 
+    /// Load and attach one kprobe by name. The program name and the kernel
+    /// symbol are the same string for both connect probes.
+    fn attach_kprobe(bpf: &mut Bpf, name: &str) -> Result<(), EbpfError> {
+        let program: &mut KProbe = bpf
+            .program_mut(name)
+            .ok_or_else(|| {
+                EbpfError::LoadFailed(format!("program {name} not found in BPF object"))
+            })?
+            .try_into()
+            .map_err(|e: aya::programs::ProgramError| {
+                EbpfError::LoadFailed(format!("not a kprobe: {e:?}"))
+            })?;
+        program
+            .load()
+            .map_err(|e| EbpfError::LoadFailed(format!("{e:?}")))?;
+        program
+            .attach(name, 0)
+            .map_err(|e| EbpfError::AttachFailed(format!("{e:?}")))?;
+        Ok(())
+    }
+
     pub fn new() -> Result<(EventSource, Receiver<EbpfEvent>), EbpfError> {
         if BPF_OBJECT.is_empty() {
             return Err(EbpfError::BpfObjectMissing);
@@ -165,22 +193,15 @@ mod linux {
         let mut bpf =
             Bpf::load(&object).map_err(|e| EbpfError::LoadFailed(format!("{e:?}")))?;
 
-        // Attach kprobe.
-        let program: &mut KProbe = bpf
-            .program_mut("tcp_v4_connect")
-            .ok_or_else(|| {
-                EbpfError::LoadFailed("program tcp_v4_connect not found in BPF object".into())
-            })?
-            .try_into()
-            .map_err(|e: aya::programs::ProgramError| {
-                EbpfError::LoadFailed(format!("not a kprobe: {e:?}"))
-            })?;
-        program
-            .load()
-            .map_err(|e| EbpfError::LoadFailed(format!("{e:?}")))?;
-        program
-            .attach("tcp_v4_connect", 0)
-            .map_err(|e| EbpfError::AttachFailed(format!("{e:?}")))?;
+        // Attach the v4 kprobe — mandatory; without it the source is useless.
+        attach_kprobe(&mut bpf, "tcp_v4_connect")?;
+
+        // Attach the v6 kprobe (Phase 2) — best-effort. The program is
+        // absent when the embedded object predates Phase 2 (stale
+        // `pre-built/` artifact), and attach fails when the kernel lacks
+        // the symbol (CONFIG_IPV6=n). Either way v4 attribution still
+        // works, so degrade silently instead of failing `new()`.
+        let _ = attach_kprobe(&mut bpf, "tcp_v6_connect");
 
         // Take ownership of the EVENTS ring buffer.
         let events_map = bpf
@@ -206,7 +227,7 @@ mod linux {
         let reader = thread::Builder::new()
             .name("netwatch-sdk-ebpf-reader".into())
             .spawn(move || {
-                use crate::wire::{ConnectV4Event, EventKind};
+                use crate::wire::{ConnectV4Event, ConnectV6Event, EventKind};
                 let mut pollfd = libc::pollfd {
                     fd: ring_fd,
                     events: libc::POLLIN,
@@ -246,7 +267,7 @@ mod linux {
                             continue;
                         }
                         let kind_byte = bytes[0];
-                        if kind_byte == EventKind::TcpV4Connect as u8 {
+                        let ev = if kind_byte == EventKind::TcpV4Connect as u8 {
                             if bytes.len() < std::mem::size_of::<ConnectV4Event>() {
                                 continue;
                             }
@@ -255,11 +276,23 @@ mod linux {
                             let raw = unsafe {
                                 std::ptr::read_unaligned(bytes.as_ptr() as *const ConnectV4Event)
                             };
-                            let ev = ConnectEvent::decode(&raw, boot);
-                            // Receiver dropped → exit the thread cleanly.
-                            if tx.send(EbpfEvent::Connect(ev)).is_err() {
-                                return;
+                            ConnectEvent::decode_v4(&raw, boot)
+                        } else if kind_byte == EventKind::TcpV6Connect as u8 {
+                            if bytes.len() < std::mem::size_of::<ConnectV6Event>() {
+                                continue;
                             }
+                            // SAFETY: same contract as above, for the
+                            // ConnectV6Event layout.
+                            let raw = unsafe {
+                                std::ptr::read_unaligned(bytes.as_ptr() as *const ConnectV6Event)
+                            };
+                            ConnectEvent::decode_v6(&raw, boot)
+                        } else {
+                            continue;
+                        };
+                        // Receiver dropped → exit the thread cleanly.
+                        if tx.send(EbpfEvent::Connect(ev)).is_err() {
+                            return;
                         }
                     }
                 }

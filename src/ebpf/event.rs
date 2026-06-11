@@ -4,10 +4,14 @@
 //! the on-the-wire `netwatch_sdk_common::*Event` structs in two important
 //! ways:
 //!
-//! 1. **Address fields are host byte order.** The kernel writes them in
-//!    network byte order (matching `struct sock`); the userspace decoder
-//!    converts before pushing onto the channel. Consumers should not have
-//!    to think about endianness.
+//! 1. **Address fields are `IpAddr` in host byte order.** The kernel
+//!    writes raw network-byte-order words (matching `struct sock`); the
+//!    userspace decoder converts before pushing onto the channel.
+//!    Consumers should not have to think about endianness — or about
+//!    which address family the kprobe fired for: v4-mapped IPv6
+//!    destinations (`::ffff:a.b.c.d`, i.e. IPv4 traffic over a dual-stack
+//!    socket) are canonicalised back to `IpAddr::V4` so cache keys match
+//!    what `/proc`/lsof report for the same connection.
 //! 2. **`comm` is a `String`.** The kernel writes a 16-byte NUL-padded
 //!    array; userspace trims and validates UTF-8 once.
 //!
@@ -15,20 +19,25 @@
 //! contract that the BPF-side copy in `crates/ebpf-programs` mirrors).
 
 use chrono::{DateTime, TimeZone, Utc};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
-/// One event from the eBPF source. New variants will land in subsequent
-/// roadmap phases (`AcceptEvent`, `CloseEvent`, `RetransmitEvent`, …).
+/// One event from the eBPF source. Marked `non_exhaustive`: new variants
+/// will land in subsequent roadmap phases (`AcceptEvent`, `CloseEvent`,
+/// `RetransmitEvent`, …) — match with a wildcard arm.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub enum EbpfEvent {
-    /// A `tcp_v4_connect` syscall fired in the kernel.
+    /// A `tcp_v4_connect` or `tcp_v6_connect` syscall fired in the kernel.
+    /// Discriminate on `ConnectEvent::daddr` if the family matters.
     Connect(ConnectEvent),
 }
 
 /// A successful connect attempt from a local TCP socket.
 ///
-/// This corresponds to one entry in the kernel's `tcp_v4_connect` kprobe.
-/// The event fires *before* the SYN is sent; whether the connection is
-/// completed is observable via a future `inet_sock_set_state` event.
+/// This corresponds to one entry in the kernel's `tcp_v4_connect` or
+/// `tcp_v6_connect` (Phase 2) kprobe. The event fires *before* the SYN
+/// is sent; whether the connection is completed is observable via a
+/// future `inet_sock_set_state` event.
 #[derive(Debug, Clone)]
 pub struct ConnectEvent {
     /// Process group id of the calling task.
@@ -37,12 +46,14 @@ pub struct ConnectEvent {
     pub pid: u32,
     /// Process command (16-char `task_struct->comm`, NULs trimmed).
     pub comm: String,
-    /// Source IPv4 address in host order. May be 0 if the socket has not
-    /// been bound at the time the kprobe fires.
-    pub saddr: std::net::Ipv4Addr,
-    /// Destination IPv4 address in host order.
-    pub daddr: std::net::Ipv4Addr,
-    /// Source port in host order. **0 in Phase 1** — the source port is
+    /// Source address in host order. Unspecified (`0.0.0.0` / `::`) when
+    /// the socket has not been bound at the time the kprobe fires —
+    /// always the case in Phases 1–2, which probe connect-entry.
+    pub saddr: IpAddr,
+    /// Destination address in host order. v4-mapped IPv6 destinations
+    /// are canonicalised to `IpAddr::V4`.
+    pub daddr: IpAddr,
+    /// Source port in host order. **0 in Phases 1–2** — the source port is
     /// stored at an offset that requires CO-RE, which lands in a later
     /// iteration. See `crates/ebpf-programs/src/main.rs`.
     pub sport: u16,
@@ -53,6 +64,10 @@ pub struct ConnectEvent {
     pub timestamp: DateTime<Utc>,
 }
 
+// Decoders are called from the ring-buffer reader, which only exists on
+// Linux — allow dead_code so non-Linux builds with `--features ebpf`
+// stay warning-free (same treatment as `estimate_boot_time`).
+#[allow(dead_code)]
 impl ConnectEvent {
     /// Decode a `crate::wire::ConnectV4Event` from the BPF ring buffer
     /// into the public, host-byte-order representation.
@@ -60,24 +75,17 @@ impl ConnectEvent {
     /// `boot_time` is the wall-clock instant when the kernel booted; we
     /// add the per-event `bpf_ktime_get_ns` to it to produce a usable
     /// timestamp.
-    pub(crate) fn decode(
+    pub(crate) fn decode_v4(
         raw: &crate::wire::ConnectV4Event,
         boot_time: DateTime<Utc>,
     ) -> Self {
-        let comm_end = raw
-            .comm
-            .iter()
-            .position(|&b| b == 0)
-            .unwrap_or(raw.comm.len());
-        let comm = String::from_utf8_lossy(&raw.comm[..comm_end]).into_owned();
-
         // Address and port fields are stored in memory in network byte
         // order. Reading them back via `to_ne_bytes()` gives us those raw
         // bytes regardless of host endianness; we then re-interpret as
         // (a) an Ipv4Addr — which takes its bytes in IP-octet order — or
         // (b) a u16 from BE bytes for the port.
-        let saddr = std::net::Ipv4Addr::from(raw.saddr.to_ne_bytes());
-        let daddr = std::net::Ipv4Addr::from(raw.daddr.to_ne_bytes());
+        let saddr = IpAddr::V4(Ipv4Addr::from(raw.saddr.to_ne_bytes()));
+        let daddr = IpAddr::V4(Ipv4Addr::from(raw.daddr.to_ne_bytes()));
         let sport = u16::from_be_bytes(raw.sport.to_ne_bytes());
         let dport = u16::from_be_bytes(raw.dport.to_ne_bytes());
 
@@ -86,7 +94,7 @@ impl ConnectEvent {
         Self {
             tgid: raw.tgid,
             pid: raw.pid,
-            comm,
+            comm: decode_comm(&raw.comm),
             saddr,
             daddr,
             sport,
@@ -94,6 +102,42 @@ impl ConnectEvent {
             timestamp,
         }
     }
+
+    /// Decode a `crate::wire::ConnectV6Event` (Phase 2). Address bytes are
+    /// already in IP-octet order in the wire struct, so they map straight
+    /// into `Ipv6Addr` — then v4-mapped addresses (`::ffff:a.b.c.d`,
+    /// produced by dual-stack sockets connecting to IPv4 peers through
+    /// `tcp_v6_connect`) are canonicalised to `IpAddr::V4` so consumers
+    /// see the same address family that `/proc`/lsof report.
+    pub(crate) fn decode_v6(
+        raw: &crate::wire::ConnectV6Event,
+        boot_time: DateTime<Utc>,
+    ) -> Self {
+        let saddr = Ipv6Addr::from(raw.saddr).to_canonical();
+        let daddr = Ipv6Addr::from(raw.daddr).to_canonical();
+        let sport = u16::from_be_bytes(raw.sport.to_ne_bytes());
+        let dport = u16::from_be_bytes(raw.dport.to_ne_bytes());
+
+        let timestamp = boot_time + chrono::Duration::nanoseconds(raw.timestamp_ns as i64);
+
+        Self {
+            tgid: raw.tgid,
+            pid: raw.pid,
+            comm: decode_comm(&raw.comm),
+            saddr,
+            daddr,
+            sport,
+            dport,
+            timestamp,
+        }
+    }
+}
+
+/// Trim a NUL-padded `task_struct->comm` into a `String`.
+#[allow(dead_code)]
+fn decode_comm(comm: &[u8]) -> String {
+    let end = comm.iter().position(|&b| b == 0).unwrap_or(comm.len());
+    String::from_utf8_lossy(&comm[..end]).into_owned()
 }
 
 /// Read kernel boot time as a wall-clock `DateTime<Utc>` so we can convert
@@ -126,10 +170,10 @@ pub(crate) fn estimate_boot_time() -> DateTime<Utc> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::wire::{ConnectV4Event, EventKind, COMM_LEN};
+    use crate::wire::{ConnectV4Event, ConnectV6Event, EventKind, COMM_LEN};
 
     #[test]
-    fn decode_converts_addresses_and_ports_to_host_order() {
+    fn decode_v4_converts_addresses_and_ports_to_host_order() {
         let mut comm = [0u8; COMM_LEN];
         comm[..4].copy_from_slice(b"curl");
         let raw = ConnectV4Event {
@@ -149,13 +193,13 @@ mod tests {
             timestamp_ns: 1_000_000_000,
         };
         let boot = Utc.timestamp_opt(1_700_000_000, 0).unwrap();
-        let ev = ConnectEvent::decode(&raw, boot);
+        let ev = ConnectEvent::decode_v4(&raw, boot);
 
         assert_eq!(ev.pid, 1235);
         assert_eq!(ev.tgid, 1234);
         assert_eq!(ev.comm, "curl");
-        assert_eq!(ev.saddr, std::net::Ipv4Addr::new(192, 168, 1, 10));
-        assert_eq!(ev.daddr, std::net::Ipv4Addr::new(1, 1, 1, 1));
+        assert_eq!(ev.saddr, IpAddr::V4(Ipv4Addr::new(192, 168, 1, 10)));
+        assert_eq!(ev.daddr, IpAddr::V4(Ipv4Addr::new(1, 1, 1, 1)));
         assert_eq!(ev.dport, 443);
         // boot + 1s
         assert_eq!(ev.timestamp.timestamp(), 1_700_000_001);
@@ -164,7 +208,51 @@ mod tests {
     #[test]
     fn decode_handles_short_comm_without_panicking() {
         let raw = ConnectV4Event::empty();
-        let ev = ConnectEvent::decode(&raw, Utc::now());
+        let ev = ConnectEvent::decode_v4(&raw, Utc::now());
         assert_eq!(ev.comm, "");
+    }
+
+    #[test]
+    fn decode_v6_converts_address_and_port() {
+        let mut comm = [0u8; COMM_LEN];
+        comm[..4].copy_from_slice(b"curl");
+        let mut raw = ConnectV6Event::empty();
+        raw.tgid = 42;
+        raw.pid = 43;
+        raw.comm = comm;
+        // 2606:4700::6810:85e5 (cloudflare), already in IP-octet order.
+        raw.daddr = [
+            0x26, 0x06, 0x47, 0x00, 0, 0, 0, 0, 0, 0, 0, 0, 0x68, 0x10, 0x85, 0xe5,
+        ];
+        raw.dport = u16::from_ne_bytes([0x01, 0xBB]); // 443, network order
+        raw.timestamp_ns = 2_000_000_000;
+
+        let boot = Utc.timestamp_opt(1_700_000_000, 0).unwrap();
+        let ev = ConnectEvent::decode_v6(&raw, boot);
+
+        assert_eq!(ev.pid, 43);
+        assert_eq!(ev.comm, "curl");
+        assert_eq!(
+            ev.daddr,
+            "2606:4700::6810:85e5".parse::<IpAddr>().unwrap()
+        );
+        assert_eq!(ev.dport, 443);
+        // The unbound source decodes as unspecified `::`.
+        assert!(ev.saddr.is_unspecified());
+        assert_eq!(ev.timestamp.timestamp(), 1_700_000_002);
+    }
+
+    #[test]
+    fn decode_v6_canonicalises_v4_mapped_destinations() {
+        let mut raw = ConnectV6Event::empty();
+        // ::ffff:93.184.216.34 — IPv4 peer reached through a dual-stack
+        // socket; tcp_v6_connect sees the v4-mapped form.
+        raw.daddr = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xff, 0xff, 93, 184, 216, 34];
+        raw.dport = u16::from_ne_bytes([0x00, 0x50]); // 80
+
+        let ev = ConnectEvent::decode_v6(&raw, Utc.timestamp_opt(0, 0).unwrap());
+
+        assert_eq!(ev.daddr, IpAddr::V4(Ipv4Addr::new(93, 184, 216, 34)));
+        assert_eq!(ev.dport, 80);
     }
 }

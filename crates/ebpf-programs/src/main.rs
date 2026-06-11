@@ -1,7 +1,8 @@
 //! netwatch-sdk eBPF programs.
 //!
-//! Phase 1 ships a single program: a kprobe on `tcp_v4_connect` that emits
-//! a `ConnectV4Event` into a ring buffer for userspace consumption.
+//! Phase 1 shipped a kprobe on `tcp_v4_connect` emitting `ConnectV4Event`s
+//! into a ring buffer. Phase 2 adds the IPv6 twin: a kprobe on
+//! `tcp_v6_connect` emitting `ConnectV6Event`s into the same ring buffer.
 //!
 //! Build with the nightly toolchain pinned in `rust-toolchain.toml`:
 //!
@@ -22,7 +23,7 @@ use aya_ebpf::{
     maps::RingBuf,
     programs::ProbeContext,
 };
-use netwatch_sdk_common::{ConnectV4Event, EventKind, COMM_LEN};
+use netwatch_sdk_common::{ConnectV4Event, ConnectV6Event, EventKind, COMM_LEN};
 
 /// BPF programs that call GPL-only kernel helpers (bpf_probe_read_kernel,
 /// bpf_ktime_get_ns, etc.) must declare a GPL-compatible license. The
@@ -114,6 +115,83 @@ fn try_tcp_v4_connect(ctx: ProbeContext) -> Result<(), i64> {
 
     // Commit. 0 flag = "wake up userspace if poll'd"; BPF_RB_NO_WAKEUP
     // would trade latency for throughput once we know the consumer pattern.
+    entry.write(event);
+    entry.submit(0);
+
+    Ok(())
+}
+
+/// `int tcp_v6_connect(struct sock *sk, struct sockaddr *uaddr, int addr_len)`
+///
+/// IPv6 twin of `tcp_v4_connect` above; same shape, same caveats. Note
+/// that dual-stack sockets connecting to IPv4 peers also come through
+/// here with a v4-mapped destination (`::ffff:a.b.c.d`) — userspace
+/// canonicalises those back to IPv4 on decode, so v4 traffic over
+/// AF_INET6 sockets is attributed too.
+#[kprobe]
+pub fn tcp_v6_connect(ctx: ProbeContext) -> u32 {
+    match try_tcp_v6_connect(ctx) {
+        Ok(_) => 0,
+        Err(_) => 1,
+    }
+}
+
+fn try_tcp_v6_connect(ctx: ProbeContext) -> Result<(), i64> {
+    use aya_ebpf::helpers::bpf_probe_read_kernel;
+
+    // Same ordering discipline as the v4 probe: read everything BEFORE
+    // reserving the ring-buffer entry so every exit path satisfies the
+    // verifier's reference accounting.
+    //
+    // `uaddr` (arg 1) is the destination `struct sockaddr_in6 *`, already
+    // copied into kernel memory by the syscall layer and valid at function
+    // ENTRY — unlike the socket's own sock_common fields, which the kernel
+    // only populates later inside tcp_v6_connect (same trap as issue #38
+    // on the v4 side).
+    let uaddr: *const u8 = ctx.arg(1).ok_or(1i64)?;
+
+    let pid_tgid = bpf_get_current_pid_tgid();
+    let tgid = (pid_tgid >> 32) as u32;
+    let pid = pid_tgid as u32;
+    let comm = bpf_get_current_comm().unwrap_or([0u8; COMM_LEN]);
+    let timestamp_ns = unsafe { bpf_ktime_get_ns() };
+
+    // struct sockaddr_in6 { sin6_family @0x00 (u16); sin6_port @0x02 (u16,
+    // net order); sin6_flowinfo @0x04 (u32); sin6_addr @0x08 ([u8; 16]);
+    // sin6_scope_id @0x18 (u32) }. Address bytes are already in IP-octet
+    // order — userspace consumes them as-is. The source address isn't
+    // assigned until routing later in connect(), so it's reported as zero
+    // and userspace keys attribution on (daddr, dport).
+    //
+    // SAFETY: aya-ebpf wraps these as bpf_probe_read_kernel calls.
+    let dport =
+        unsafe { bpf_probe_read_kernel::<u16>(uaddr.add(0x02) as *const u16).unwrap_or(0) };
+    let daddr = unsafe {
+        bpf_probe_read_kernel::<[u8; 16]>(uaddr.add(0x08) as *const [u8; 16]).unwrap_or([0; 16])
+    };
+    let saddr = [0u8; 16];
+    let sport: u16 = 0;
+
+    // Now reserve. No early returns past this point: we either submit or
+    // discard on every path, satisfying the verifier's reference-accounting
+    // rules.
+    let Some(mut entry) = EVENTS.reserve::<ConnectV6Event>(0) else {
+        return Err(0);
+    };
+
+    let event = ConnectV6Event {
+        kind: EventKind::TcpV6Connect,
+        _pad0: [0; 3],
+        tgid,
+        pid,
+        saddr,
+        daddr,
+        sport,
+        dport,
+        comm,
+        timestamp_ns,
+    };
+
     entry.write(event);
     entry.submit(0);
 
