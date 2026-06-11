@@ -46,10 +46,15 @@ impl RttHistory {
 }
 
 pub fn run_ping(target: &str) -> PingResult {
-    let output = match Command::new("ping")
-        .args(["-c", "3", "-W", "1", target])
-        .output()
-    {
+    let binary = ping_binary(target);
+    let mut cmd = Command::new(binary);
+    cmd.args(["-c", "3"]);
+    // Per-reply wait: macOS ping6 has no -W and errors out on it; its
+    // default reply timeout bounds the probe instead.
+    if binary != "ping6" {
+        cmd.args(["-W", "1"]);
+    }
+    let output = match cmd.arg(target).output() {
         Ok(o) => o,
         Err(_) => {
             return PingResult {
@@ -63,6 +68,18 @@ pub fn run_ping(target: &str) -> PingResult {
     PingResult {
         rtt_ms: parse_avg_rtt(&text),
         loss_pct: parse_loss(&text),
+    }
+}
+
+/// macOS `ping` is IPv4-only — IPv6 targets (e.g. the link-local
+/// `fe80::…%en0` nameserver an iPhone hotspot advertises first) fail with
+/// "cannot resolve", which silently nulled DNS RTT on v6-first networks.
+/// Linux iputils `ping` handles both families natively.
+fn ping_binary(target: &str) -> &'static str {
+    if cfg!(target_os = "macos") && target.contains(':') {
+        "ping6"
+    } else {
+        "ping"
     }
 }
 
@@ -220,5 +237,30 @@ mod tests {
             );
             assert!((result.loss_pct - 100.0).abs() < f64::EPSILON);
         }
+    }
+}
+
+
+#[cfg(test)]
+mod ping_binary_tests {
+    use super::*;
+
+    #[test]
+    fn ipv6_targets_use_ping6_on_macos_only() {
+        let v6 = ping_binary("fe80::6c3a:ffff:fe33:9864%en0");
+        let v4 = ping_binary("172.20.10.1");
+        assert_eq!(v4, "ping");
+        if cfg!(target_os = "macos") {
+            assert_eq!(v6, "ping6");
+        } else {
+            assert_eq!(v6, "ping");
+        }
+    }
+
+    #[test]
+    fn live_ping_localhost_v6_yields_rtt() {
+        // ::1 is always present; exercises the ping6 arg path end to end.
+        let r = run_ping("::1");
+        assert!(r.rtt_ms.is_some(), "loopback v6 ping should produce an RTT");
     }
 }
