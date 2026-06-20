@@ -23,5 +23,5 @@
 mod event;
 mod source;
 
-pub use event::{ConnectEvent, EbpfEvent};
+pub use event::{ConnectEvent, EbpfEvent, Protocol};
 pub use source::{EbpfError, EventSource};

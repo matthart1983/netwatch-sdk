@@ -27,19 +27,32 @@ use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 #[derive(Debug, Clone)]
 #[non_exhaustive]
 pub enum EbpfEvent {
-    /// A `tcp_v4_connect` or `tcp_v6_connect` syscall fired in the kernel.
-    /// Discriminate on `ConnectEvent::daddr` if the family matters.
+    /// A TCP (`tcp_v{4,6}_connect`) or connected-UDP
+    /// (`ip{4,6}_datagram_connect`) connect fired in the kernel.
+    /// Discriminate on `ConnectEvent::daddr` for family and
+    /// `ConnectEvent::protocol` for transport.
     Connect(ConnectEvent),
 }
 
-/// A successful connect attempt from a local TCP socket.
+/// Transport protocol the connect event came from. UDP events come from
+/// the datagram-connect kprobes (a *connected* UDP socket, the QUIC client
+/// pattern); unconnected `sendto`/`sendmsg` UDP is not yet attributed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum Protocol {
+    Tcp,
+    Udp,
+}
+
+/// A successful connect attempt from a local TCP or connected-UDP socket.
 ///
-/// This corresponds to one entry in the kernel's `tcp_v4_connect` or
-/// `tcp_v6_connect` (Phase 2) kprobe. The event fires *before* the SYN
-/// is sent; whether the connection is completed is observable via a
-/// future `inet_sock_set_state` event.
+/// This corresponds to one entry in the kernel's `tcp_v{4,6}_connect` or
+/// `ip{4,6}_datagram_connect` kprobe. The event fires *before* the first
+/// packet is sent; whether a TCP connection is completed is observable via
+/// a future `inet_sock_set_state` event.
 #[derive(Debug, Clone)]
 pub struct ConnectEvent {
+    /// Transport protocol — TCP or (connected) UDP.
+    pub protocol: Protocol,
     /// Process group id of the calling task.
     pub tgid: u32,
     /// Thread id of the calling task.
@@ -78,6 +91,7 @@ impl ConnectEvent {
     pub(crate) fn decode_v4(
         raw: &crate::wire::ConnectV4Event,
         boot_time: DateTime<Utc>,
+        protocol: Protocol,
     ) -> Self {
         // Address and port fields are stored in memory in network byte
         // order. Reading them back via `to_ne_bytes()` gives us those raw
@@ -92,6 +106,7 @@ impl ConnectEvent {
         let timestamp = boot_time + chrono::Duration::nanoseconds(raw.timestamp_ns as i64);
 
         Self {
+            protocol,
             tgid: raw.tgid,
             pid: raw.pid,
             comm: decode_comm(&raw.comm),
@@ -112,6 +127,7 @@ impl ConnectEvent {
     pub(crate) fn decode_v6(
         raw: &crate::wire::ConnectV6Event,
         boot_time: DateTime<Utc>,
+        protocol: Protocol,
     ) -> Self {
         let saddr = Ipv6Addr::from(raw.saddr).to_canonical();
         let daddr = Ipv6Addr::from(raw.daddr).to_canonical();
@@ -121,6 +137,7 @@ impl ConnectEvent {
         let timestamp = boot_time + chrono::Duration::nanoseconds(raw.timestamp_ns as i64);
 
         Self {
+            protocol,
             tgid: raw.tgid,
             pid: raw.pid,
             comm: decode_comm(&raw.comm),
@@ -193,8 +210,9 @@ mod tests {
             timestamp_ns: 1_000_000_000,
         };
         let boot = Utc.timestamp_opt(1_700_000_000, 0).unwrap();
-        let ev = ConnectEvent::decode_v4(&raw, boot);
+        let ev = ConnectEvent::decode_v4(&raw, boot, Protocol::Tcp);
 
+        assert_eq!(ev.protocol, Protocol::Tcp);
         assert_eq!(ev.pid, 1235);
         assert_eq!(ev.tgid, 1234);
         assert_eq!(ev.comm, "curl");
@@ -208,8 +226,18 @@ mod tests {
     #[test]
     fn decode_handles_short_comm_without_panicking() {
         let raw = ConnectV4Event::empty();
-        let ev = ConnectEvent::decode_v4(&raw, Utc::now());
+        let ev = ConnectEvent::decode_v4(&raw, Utc::now(), Protocol::Tcp);
         assert_eq!(ev.comm, "");
+    }
+
+    #[test]
+    fn decode_tags_udp_protocol_from_the_datagram_connect_kinds() {
+        // The UDP datagram-connect kprobes reuse the ConnectV{4,6}Event
+        // layout; only the protocol passed by the dispatcher differs.
+        let v4 = ConnectEvent::decode_v4(&ConnectV4Event::empty(), Utc::now(), Protocol::Udp);
+        assert_eq!(v4.protocol, Protocol::Udp);
+        let v6 = ConnectEvent::decode_v6(&ConnectV6Event::empty(), Utc::now(), Protocol::Udp);
+        assert_eq!(v6.protocol, Protocol::Udp);
     }
 
     #[test]
@@ -228,7 +256,7 @@ mod tests {
         raw.timestamp_ns = 2_000_000_000;
 
         let boot = Utc.timestamp_opt(1_700_000_000, 0).unwrap();
-        let ev = ConnectEvent::decode_v6(&raw, boot);
+        let ev = ConnectEvent::decode_v6(&raw, boot, Protocol::Tcp);
 
         assert_eq!(ev.pid, 43);
         assert_eq!(ev.comm, "curl");
@@ -250,7 +278,7 @@ mod tests {
         raw.daddr = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xff, 0xff, 93, 184, 216, 34];
         raw.dport = u16::from_ne_bytes([0x00, 0x50]); // 80
 
-        let ev = ConnectEvent::decode_v6(&raw, Utc.timestamp_opt(0, 0).unwrap());
+        let ev = ConnectEvent::decode_v6(&raw, Utc.timestamp_opt(0, 0).unwrap(), Protocol::Tcp);
 
         assert_eq!(ev.daddr, IpAddr::V4(Ipv4Addr::new(93, 184, 216, 34)));
         assert_eq!(ev.dport, 80);

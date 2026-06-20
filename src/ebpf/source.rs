@@ -115,7 +115,7 @@ mod platform {
 #[cfg(target_os = "linux")]
 mod linux {
     use super::*;
-    use crate::ebpf::event::{estimate_boot_time, ConnectEvent};
+    use crate::ebpf::event::{estimate_boot_time, ConnectEvent, Protocol};
     use aya::{maps::RingBuf, programs::KProbe, Bpf};
     use std::os::fd::AsRawFd;
     use std::sync::atomic::{AtomicBool, Ordering};
@@ -196,12 +196,37 @@ mod linux {
         // Attach the v4 kprobe — mandatory; without it the source is useless.
         attach_kprobe(&mut bpf, "tcp_v4_connect")?;
 
-        // Attach the v6 kprobe (Phase 2) — best-effort. The program is
-        // absent when the embedded object predates Phase 2 (stale
-        // `pre-built/` artifact), and attach fails when the kernel lacks
-        // the symbol (CONFIG_IPV6=n). Either way v4 attribution still
-        // works, so degrade silently instead of failing `new()`.
+        // Attach the v6 TCP twin (Phase 2) best-effort: absent when the
+        // embedded object predates Phase 2 or under CONFIG_IPV6=n. v4 TCP
+        // attribution still works, so degrade silently instead of failing.
         let _ = attach_kprobe(&mut bpf, "tcp_v6_connect");
+
+        // Connected-UDP probes (Phase 2, QUIC) — fire only when an app
+        // `connect()`s its UDP socket (browsers/quiche do for QUIC);
+        // unconnected `sendto`/`sendmsg` UDP stays unattributed. Kernel
+        // builds disagree on whether the datagram-connect wrapper or its
+        // `__`-prefixed inner is on the call path (the other is inlined or
+        // absent), so attach every candidate best-effort: whichever fires
+        // populates the cache, and a double-fire is idempotent (identical
+        // `(proto, daddr, dport)` key). Individual misses are expected and
+        // silent; warn only if the whole family failed — that means UDP/QUIC
+        // attribution is off and a user wondering why their QUIC flows have
+        // no process should see the reason.
+        let udp_attached = [
+            "ip4_datagram_connect",
+            "__ip4_datagram_connect",
+            "ip6_datagram_connect",
+            "__ip6_datagram_connect",
+        ]
+        .into_iter()
+        .filter(|name| attach_kprobe(&mut bpf, name).is_ok())
+        .count();
+        if udp_attached == 0 {
+            eprintln!(
+                "netwatch-sdk: no connected-UDP kprobes attached; UDP/QUIC \
+                 process attribution disabled on this kernel"
+            );
+        }
 
         // Take ownership of the EVENTS ring buffer.
         let events_map = bpf
@@ -267,7 +292,25 @@ mod linux {
                             continue;
                         }
                         let kind_byte = bytes[0];
-                        let ev = if kind_byte == EventKind::TcpV4Connect as u8 {
+                        // TCP and connected-UDP share the wire layout
+                        // (ConnectV4Event / ConnectV6Event); only the kind
+                        // discriminant — and thus the transport we tag the
+                        // decoded event with — differs.
+                        let v4_proto = if kind_byte == EventKind::TcpV4Connect as u8 {
+                            Some(Protocol::Tcp)
+                        } else if kind_byte == EventKind::UdpV4Connect as u8 {
+                            Some(Protocol::Udp)
+                        } else {
+                            None
+                        };
+                        let v6_proto = if kind_byte == EventKind::TcpV6Connect as u8 {
+                            Some(Protocol::Tcp)
+                        } else if kind_byte == EventKind::UdpV6Connect as u8 {
+                            Some(Protocol::Udp)
+                        } else {
+                            None
+                        };
+                        let ev = if let Some(proto) = v4_proto {
                             if bytes.len() < std::mem::size_of::<ConnectV4Event>() {
                                 continue;
                             }
@@ -276,8 +319,8 @@ mod linux {
                             let raw = unsafe {
                                 std::ptr::read_unaligned(bytes.as_ptr() as *const ConnectV4Event)
                             };
-                            ConnectEvent::decode_v4(&raw, boot)
-                        } else if kind_byte == EventKind::TcpV6Connect as u8 {
+                            ConnectEvent::decode_v4(&raw, boot, proto)
+                        } else if let Some(proto) = v6_proto {
                             if bytes.len() < std::mem::size_of::<ConnectV6Event>() {
                                 continue;
                             }
@@ -286,7 +329,7 @@ mod linux {
                             let raw = unsafe {
                                 std::ptr::read_unaligned(bytes.as_ptr() as *const ConnectV6Event)
                             };
-                            ConnectEvent::decode_v6(&raw, boot)
+                            ConnectEvent::decode_v6(&raw, boot, proto)
                         } else {
                             continue;
                         };

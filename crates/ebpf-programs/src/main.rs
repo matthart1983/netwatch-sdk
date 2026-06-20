@@ -47,13 +47,41 @@ static EVENTS: RingBuf = RingBuf::with_byte_size(256 * 1024, 0);
 /// order — userspace converts on decode.
 #[kprobe]
 pub fn tcp_v4_connect(ctx: ProbeContext) -> u32 {
-    match try_tcp_v4_connect(ctx) {
+    match try_v4_connect(ctx, EventKind::TcpV4Connect) {
         Ok(_) => 0,
         Err(_) => 1,
     }
 }
 
-fn try_tcp_v4_connect(ctx: ProbeContext) -> Result<(), i64> {
+/// `int ip4_datagram_connect(struct sock *sk, struct sockaddr *uaddr, int addr_len)`
+///
+/// Connected-UDP twin of `tcp_v4_connect`: a process `connect()`ing a UDP
+/// socket (the QUIC client pattern) routes through here. Same signature,
+/// and the syscall layer has already copied `uaddr` into kernel memory, so
+/// the destination read is identical — only the emitted `EventKind` differs.
+#[kprobe]
+pub fn ip4_datagram_connect(ctx: ProbeContext) -> u32 {
+    match try_v4_connect(ctx, EventKind::UdpV4Connect) {
+        Ok(_) => 0,
+        Err(_) => 1,
+    }
+}
+
+/// Inner worker `__ip4_datagram_connect(sk, uaddr, addr_len)`. Some kernel
+/// builds set `udp_prot.connect` to the inner (or inline the wrapper), so
+/// the outer `ip4_datagram_connect` kprobe never fires; others inline the
+/// inner and only the outer exists. We attach both best-effort — same
+/// signature, same `(proto, daddr, dport)` key, so a double-fire just
+/// overwrites idempotently and a missing symbol is skipped.
+#[kprobe]
+pub fn __ip4_datagram_connect(ctx: ProbeContext) -> u32 {
+    match try_v4_connect(ctx, EventKind::UdpV4Connect) {
+        Ok(_) => 0,
+        Err(_) => 1,
+    }
+}
+
+fn try_v4_connect(ctx: ProbeContext, kind: EventKind) -> Result<(), i64> {
     use aya_ebpf::helpers::bpf_probe_read_kernel;
 
     // Pull every field we need BEFORE reserving the ring-buffer entry.
@@ -101,7 +129,7 @@ fn try_tcp_v4_connect(ctx: ProbeContext) -> Result<(), i64> {
     };
 
     let event = ConnectV4Event {
-        kind: EventKind::TcpV4Connect,
+        kind,
         _pad0: [0; 3],
         tgid,
         pid,
@@ -130,13 +158,38 @@ fn try_tcp_v4_connect(ctx: ProbeContext) -> Result<(), i64> {
 /// AF_INET6 sockets is attributed too.
 #[kprobe]
 pub fn tcp_v6_connect(ctx: ProbeContext) -> u32 {
-    match try_tcp_v6_connect(ctx) {
+    match try_v6_connect(ctx, EventKind::TcpV6Connect) {
         Ok(_) => 0,
         Err(_) => 1,
     }
 }
 
-fn try_tcp_v6_connect(ctx: ProbeContext) -> Result<(), i64> {
+/// `int ip6_datagram_connect(struct sock *sk, struct sockaddr *uaddr, int addr_len)`
+///
+/// Connected-UDP twin of `tcp_v6_connect` (QUIC over IPv6). Same signature
+/// and the same kernel-copied `uaddr`, so the destination read matches —
+/// only the emitted `EventKind` differs.
+#[kprobe]
+pub fn ip6_datagram_connect(ctx: ProbeContext) -> u32 {
+    match try_v6_connect(ctx, EventKind::UdpV6Connect) {
+        Ok(_) => 0,
+        Err(_) => 1,
+    }
+}
+
+/// Inner worker `__ip6_datagram_connect(sk, uaddr, addr_len)` — IPv6 twin of
+/// `__ip4_datagram_connect`. On the test kernel (6.17) this is the symbol
+/// actually on the UDP connect path; the outer `ip6_datagram_connect` is
+/// never entered. Attached best-effort alongside the wrapper.
+#[kprobe]
+pub fn __ip6_datagram_connect(ctx: ProbeContext) -> u32 {
+    match try_v6_connect(ctx, EventKind::UdpV6Connect) {
+        Ok(_) => 0,
+        Err(_) => 1,
+    }
+}
+
+fn try_v6_connect(ctx: ProbeContext, kind: EventKind) -> Result<(), i64> {
     use aya_ebpf::helpers::bpf_probe_read_kernel;
 
     // Same ordering discipline as the v4 probe: read everything BEFORE
@@ -180,7 +233,7 @@ fn try_tcp_v6_connect(ctx: ProbeContext) -> Result<(), i64> {
     };
 
     let event = ConnectV6Event {
-        kind: EventKind::TcpV6Connect,
+        kind,
         _pad0: [0; 3],
         tgid,
         pid,

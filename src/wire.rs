@@ -34,6 +34,13 @@ pub enum EventKind {
     InetCskAccept = 3,
     /// `inet_sock_set_state` tracepoint, reporting close.
     SockClose = 4,
+    /// `ip4_datagram_connect` kprobe fired — a *connected* UDP socket
+    /// (the QUIC client pattern). Reuses `ConnectV4Event`; only the kind
+    /// differs from `TcpV4Connect`.
+    UdpV4Connect = 5,
+    /// `ip6_datagram_connect` kprobe fired — connected UDP over IPv6.
+    /// Reuses `ConnectV6Event`.
+    UdpV6Connect = 6,
 }
 
 /// IPv4 connect event. Written by the `tcp_v4_connect` kprobe.
