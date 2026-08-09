@@ -101,8 +101,17 @@ pub fn parse_ps_line(line: &str, now: DateTime<Utc>) -> Option<(u32, ProcMeta)> 
     let mem_virt_bytes = fields[5].parse::<u64>().ok().map(|kb| kb * 1024);
     // Linux appends modifier chars ("Ssl"); keep the primary state only.
     let state = fields[6].chars().next().map(|c| c.to_string());
-    let started_at =
-        parse_etime_secs(fields[7]).map(|secs| now - chrono::Duration::seconds(secs as i64));
+    // `now - Duration::seconds(secs)` panics when the result falls outside
+    // chrono's representable range, and it took the whole agent down in the
+    // field: right after boot, NTP stepping the clock backwards makes `ps`
+    // report an enormous etime, which then underflows the subtraction. A
+    // process whose start time we cannot place is worth a `None`, never a
+    // crash of the collector — so both the span and the subtraction are
+    // checked, and an unrepresentable value simply drops the field.
+    let started_at = parse_etime_secs(fields[7])
+        .and_then(|secs| i64::try_from(secs).ok())
+        .and_then(chrono::TimeDelta::try_seconds)
+        .and_then(|elapsed| now.checked_sub_signed(elapsed));
     let cmd = exe_path(pid, comm);
 
     Some((
@@ -152,7 +161,12 @@ pub fn parse_etime_secs(s: &str) -> Option<u64> {
         2 => (0, parts[0].parse().ok()?, parts[1].parse().ok()?),
         _ => return None,
     };
-    Some(days * 86400 + h * 3600 + m * 60 + sec)
+    // Checked throughout: a `ps` row claiming ~2^63 days would otherwise panic
+    // here in a debug build and silently wrap in a release one.
+    days.checked_mul(86400)?
+        .checked_add(h.checked_mul(3600)?)?
+        .checked_add(m.checked_mul(60)?)?
+        .checked_add(sec)
 }
 
 #[cfg(test)]
@@ -169,6 +183,44 @@ mod tests {
         );
         assert_eq!(parse_etime_secs("42"), None);
         assert_eq!(parse_etime_secs(""), None);
+    }
+
+    #[test]
+    fn etime_with_absurd_day_count_returns_none_instead_of_overflowing() {
+        // `days * 86400` overflows u64 here; unchecked it panics in debug and
+        // wraps to a small plausible-looking number in release.
+        assert_eq!(parse_etime_secs("99999999999999999999-00:00:00"), None);
+        assert_eq!(
+            parse_etime_secs(&format!("{}-00:00:00", u64::MAX)),
+            None
+        );
+    }
+
+    #[test]
+    fn unrepresentable_start_time_drops_the_field_and_does_not_panic() {
+        // The field crash: after boot, NTP steps the clock and `ps` reports an
+        // etime far larger than the age of the universe. Subtracting it used to
+        // panic with "`DateTime - TimeDelta` overflowed" and kill the agent.
+        let now = Utc::now();
+        let line = format!(
+            "  1234   1 root   0.0 100 200 S {}-00:00:00 /usr/bin/thing",
+            u32::MAX
+        );
+        let (pid, meta) = parse_ps_line(&line, now).expect("row still parses");
+        assert_eq!(pid, 1234);
+        // Everything else survives; only the unplaceable timestamp is dropped.
+        assert_eq!(meta.started_at, None);
+        assert_eq!(meta.state.as_deref(), Some("S"));
+        assert_eq!(meta.user.as_deref(), Some("root"));
+    }
+
+    #[test]
+    fn a_sane_start_time_is_still_computed() {
+        let now = Utc::now();
+        let line = "  1234   1 root   0.0 100 200 S 01:00:00 /usr/bin/thing";
+        let (_, meta) = parse_ps_line(line, now).expect("row parses");
+        let started = meta.started_at.expect("start time present");
+        assert_eq!((now - started).num_seconds(), 3600);
     }
 
     #[test]
