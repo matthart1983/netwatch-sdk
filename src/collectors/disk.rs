@@ -114,7 +114,8 @@ pub fn parse_macos_mount(text: &str) -> Vec<MountEntry> {
 }
 
 /// Sum read/write byte totals from `/proc/diskstats`, skipping pseudo-devices
-/// (`loop*`, `ram*`, `dm-*`).
+/// (`loop*`, `ram*`, `dm-*`) and partitions: a whole-disk row (`sda`) already
+/// counts the I/O of its partitions (`sda1`), so adding both counts it twice.
 ///
 /// Each row of `/proc/diskstats` has at least 14 whitespace-separated columns;
 /// fields 5 and 9 are the cumulative sectors-read and sectors-written counters.
@@ -126,13 +127,19 @@ pub fn parse_proc_diskstats(text: &str) -> Option<DiskIo> {
     let mut total_write_bytes = 0u64;
     let mut found = false;
 
-    for line in text.lines() {
-        let parts: Vec<&str> = line.split_whitespace().collect();
-        if parts.len() < 14 {
-            continue;
-        }
+    let rows: Vec<Vec<&str>> = text
+        .lines()
+        .map(|line| line.split_whitespace().collect::<Vec<&str>>())
+        .filter(|parts| parts.len() >= 14)
+        .collect();
+    let names: Vec<&str> = rows.iter().map(|parts| parts[2]).collect();
+
+    for parts in &rows {
         let name = parts[2];
         if name.starts_with("loop") || name.starts_with("ram") || name.starts_with("dm-") {
+            continue;
+        }
+        if names.iter().any(|disk| is_partition_of(name, disk)) {
             continue;
         }
 
@@ -152,6 +159,23 @@ pub fn parse_proc_diskstats(text: &str) -> Option<DiskIo> {
     } else {
         None
     }
+}
+
+/// Whether `name` is a partition of `disk`: `sda1` of `sda`, and with a `p`
+/// when the disk name ends in a digit, `nvme0n1p1` of `nvme0n1`.
+fn is_partition_of(name: &str, disk: &str) -> bool {
+    let Some(rest) = name.strip_prefix(disk) else {
+        return false;
+    };
+    let number = if disk.ends_with(|c: char| c.is_ascii_digit()) {
+        match rest.strip_prefix('p') {
+            Some(number) => number,
+            None => return false,
+        }
+    } else {
+        rest
+    };
+    !number.is_empty() && number.bytes().all(|b| b.is_ascii_digit())
 }
 
 /// `statvfs` a single mount and turn it into a `DiskUsage`.
@@ -368,20 +392,37 @@ map auto_home on /home (autofs, automounted, nobrowse)
     // ── parse_proc_diskstats ─────────────────────────────────────────────
 
     #[test]
-    fn diskstats_sums_real_devices() {
+    fn diskstats_sums_whole_disks_only() {
         // /proc/diskstats columns:
         //   1=major 2=minor 3=name 4=reads_done 5=reads_merged 6=sectors_read
         //   7=time_reading_ms 8=writes_done 9=writes_merged 10=sectors_written ...
+        // A whole-disk row already includes its partitions' I/O.
         let sample = "\
    8       0 sda 1000 0 2000 100 500 0 4000 200 0 100 100 0 0
    8       1 sda1 800 0 1500 80 400 0 3000 150 0 80 80 0 0
  259       0 nvme0n1 200 0 1000 50 100 0 500 25 0 50 50 0 0
+ 259       1 nvme0n1p1 150 0 900 40 90 0 450 20 0 40 40 0 0
+ 179       0 mmcblk0 10 0 100 5 10 0 50 5 0 5 5 0 0
+ 179       1 mmcblk0p1 10 0 100 5 10 0 50 5 0 5 5 0 0
 ";
         let io = parse_proc_diskstats(sample).unwrap();
-        // sectors_read = 2000 + 1500 + 1000 = 4500; bytes = ×512 = 2_304_000
-        assert_eq!(io.read_bytes, 4500u64 * 512);
-        // sectors_written = 4000 + 3000 + 500 = 7500; bytes = ×512 = 3_840_000
-        assert_eq!(io.write_bytes, 7500u64 * 512);
+        // sectors_read = 2000 + 1000 + 100 (sda, nvme0n1, mmcblk0)
+        assert_eq!(io.read_bytes, 3100u64 * 512);
+        // sectors_written = 4000 + 500 + 50
+        assert_eq!(io.write_bytes, 4550u64 * 512);
+    }
+
+    #[test]
+    fn diskstats_keeps_disks_whose_names_share_a_prefix() {
+        // nvme0n10 is a namespace, not a partition of nvme0n1; sdaa is a disk
+        let sample = "\
+ 259       0 nvme0n1 200 0 1000 50 100 0 500 25 0 50 50 0 0
+ 259       5 nvme0n10 200 0 1000 50 100 0 500 25 0 50 50 0 0
+   8       0 sda 1000 0 2000 100 500 0 4000 200 0 100 100 0 0
+  65     160 sdaa 1000 0 2000 100 500 0 4000 200 0 100 100 0 0
+";
+        let io = parse_proc_diskstats(sample).unwrap();
+        assert_eq!(io.read_bytes, 6000u64 * 512);
     }
 
     #[test]
